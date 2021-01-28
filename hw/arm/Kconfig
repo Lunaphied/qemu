@@ -316,6 +316,10 @@ config ALLWINNER_H3
     select USB_EHCI_SYSBUS
     select SD
 
+config APPLE_M1
+    bool
+    select EXYNOS4
+
 config RASPI
     bool
     select FRAMEBUFFER
