@@ -164,10 +164,10 @@ static void apple_m1_init(MachineState *machine)
     // Point the framebuffer somewhere safe
     *(uint64_t*) ((uint8_t*) boot_args_data + 40) = memmap[VIRT_FB].base;
     // Give it a meaningful stride, width, height and depth
-    *(uint64_t*) ((uint8_t*) boot_args_data + 56) = 4;   // stride
-    *(uint64_t*) ((uint8_t*) boot_args_data + 64) = 800; // width
-    *(uint64_t*) ((uint8_t*) boot_args_data + 72) = 600; // height
-    *(uint64_t*) ((uint8_t*) boot_args_data + 80) = 10;  // depth
+    *(uint64_t*) ((uint8_t*) boot_args_data + 56) = 4*800;  // stride
+    *(uint64_t*) ((uint8_t*) boot_args_data + 64) = 800;    // width
+    *(uint64_t*) ((uint8_t*) boot_args_data + 72) = 600;    // height
+    *(uint64_t*) ((uint8_t*) boot_args_data + 80) = 30;     // depth
     // This sets us up with a device tree at 0x1000 which defines nothing
     *(uint64_t*) ((uint8_t*) boot_args_data + 96) = 0x1000;             // address
     *(uint32_t*) ((uint8_t*) boot_args_data + 104) = sizeof(uint32_t)*2; // size
