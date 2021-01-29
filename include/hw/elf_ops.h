@@ -502,11 +502,6 @@ static int glue(load_elf, SZ)(const char *name, int fd,
                 glue(elf_reloc, SZ)(&ehdr, fd, must_swab,  translate_fn,
                                     translate_opaque, data, ph, elf_machine);
             } else {
-                // XXX: Horrible hack because public interfaces to change load
-                //      base without adjusting anything else don't exist and just
-                //      using translate is difficult to do without reimplementing
-                //      
-                ph->p_paddr +=  0x10000;
                 addr = ph->p_paddr;
             }
 

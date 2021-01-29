@@ -7,7 +7,8 @@
 enum {
     VIRT_MEM,   // A block of ram
     VIRT_UART,  // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
-    BOOT_ARGS   // We setup a block of ROM to make pretend boot arguments to match what the real hardware does
+    BOOT_ARGS,  // We setup a block of ROM to make pretend boot arguments to match what the real hardware does
+    VIRT_FB,    // The m1n1 code expects a framebuffer, for now this just means to dump ram in this region
 };
 
 // We create an "m1 soc" but realistically the chip has a model, should we use that instead? this is pretty

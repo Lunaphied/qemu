@@ -47,6 +47,7 @@ static const struct MemMapEntry memmap[] = {
     [BOOT_ARGS] =           {         0x0,     0x10000},
     [VIRT_MEM] =            {     0x10000,       8*GiB},
     [VIRT_UART] =           { 0x235200000,     0x10000},
+    [VIRT_FB] =             { 0x300000000,       8*GiB},
 };
 
 static void apple_m1_soc_init(Object *obj) {
@@ -128,6 +129,7 @@ static void apple_m1_init(MachineState *machine)
 
     m1 = APPLE_M1_SOC(qdev_new(TYPE_APPLE_M1_SOC));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
+    //CPU(&m1->maincore)->memory = machine->ram;
     qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
 
     // This initializes the memory region map
@@ -137,6 +139,12 @@ static void apple_m1_init(MachineState *machine)
     MemoryRegion *boot_args = g_new0(MemoryRegion, 1);
     memory_region_init_rom(boot_args, NULL, "boot-args", memmap[BOOT_ARGS].size, &error_abort);
     memory_region_add_subregion(sysmem, memmap[BOOT_ARGS].base, boot_args);
+
+    // Again this should probably go in the SoC state struct or the machine struct (probably the SoC since it's all)
+    // technically part of the M1 itself unlike most things (raspi SoC is again a good reference)
+    MemoryRegion *fb_mem = g_new0(MemoryRegion, 1);
+    memory_region_init_ram(fb_mem, NULL, "framebuffer", memmap[VIRT_FB].size, &error_abort);
+    memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
     memory_region_add_subregion(sysmem, memmap[VIRT_MEM].base, machine->ram);
 
     // Used to add bootargs, yes I know this memory leaks but it doesn't matter
@@ -153,13 +161,20 @@ static void apple_m1_init(MachineState *machine)
     // Set the end of kernel address to like some value far after m1n1 (fixes heap code)
     // XXX: This especially of all things will need fixing
     *(uint64_t*) ((uint8_t*) boot_args_data + 32) = memmap[VIRT_MEM].base+0x40000;
+    // Point the framebuffer somewhere safe
+    *(uint64_t*) ((uint8_t*) boot_args_data + 40) = memmap[VIRT_FB].base;
+    // Give it a meaningful stride, width, height and depth
+    *(uint64_t*) ((uint8_t*) boot_args_data + 56) = 4;   // stride
+    *(uint64_t*) ((uint8_t*) boot_args_data + 64) = 800; // width
+    *(uint64_t*) ((uint8_t*) boot_args_data + 72) = 600; // height
+    *(uint64_t*) ((uint8_t*) boot_args_data + 80) = 10;  // depth
     // This sets us up with a device tree at 0x1000 which defines nothing
     *(uint64_t*) ((uint8_t*) boot_args_data + 96) = 0x1000;             // address
     *(uint32_t*) ((uint8_t*) boot_args_data + 104) = sizeof(uint32_t)*2; // size
     
     // Setup the data to be written into ROM before the CPU boots
     rom_add_blob_fixed("boot-args", boot_args_data, 0x300, memmap[BOOT_ARGS].base);
-    
+
     // Stupid stub device tree because m1n1 assumes the size will be greater than 0 without checking
     // Defines zero properties and zero children
     uint32_t adt_header[2] = {0x0, 0x0};
