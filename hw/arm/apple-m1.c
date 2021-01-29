@@ -142,10 +142,18 @@ static void apple_m1_init(MachineState *machine)
     // which is annoying
     void* boot_args_data = g_new0(uint8_t, 0x300);
     // set the revision to something noticable
-    *(uint32_t*) ((uint8_t*) boot_args_data + 0) = 0xdead;
+    *(uint16_t*) ((uint8_t*) boot_args_data + 0) = 0xdead;
+    // Set virtual and physical base to the same value since virtual load wasn't performed
+    *(uint64_t*) ((uint8_t*) boot_args_data + 8) = memmap[VIRT_MEM].base;
+    *(uint64_t*) ((uint8_t*) boot_args_data + 16) = memmap[VIRT_MEM].base;    
     // set the memory size to the correct value
-    *(uint64_t*) ((uint8_t*) boot_args_data + 20) = memmap[VIRT_MEM].size;
+    *(uint64_t*) ((uint8_t*) boot_args_data + 24) = memmap[VIRT_MEM].size;
+    // Set the end of kernel address to like some value far after m1n1
+    // XXX: This especially of all things will need fixing
+    *(uint64_t*) ((uint8_t*) boot_args_data + 32) = memmap[VIRT_MEM].base+0x40000;
+    // Setup the data to be written into ROM before the CPU boots
     rom_add_blob_fixed("boot-args", boot_args_data, 0x300, memmap[BOOT_ARGS].base);
+    // Free our temp data, (the previous step copies it elsewhere)
     g_free(boot_args_data);
 
     m1_boot_info.loader_start = memmap[VIRT_MEM].base;
