@@ -506,7 +506,8 @@ static int glue(load_elf, SZ)(const char *name, int fd,
                 //      base without adjusting anything else don't exist and just
                 //      using translate is difficult to do without reimplementing
                 //      
-                addr = ph->p_paddr + 0x10000;
+                ph->p_paddr +=  0x10000;
+                addr = ph->p_paddr;
             }
 
             if (data_swab) {

@@ -26,10 +26,12 @@
 //   unfortunately that doesn't get you very far, and there's some not so great stuff here too just to tie
 //   it all together to get an interesting demo
 // - The "M1" is emulated as if it's an SoC containing multiple Cortex-A72 cores, that's not true in reality,
-//   Apple has custom cores that have some special functionality that might be worth emulating, but now we have
-//   to edit the actual aarch64 emualtion logic (and we don't know the changes in full yet other than registers).
-//   I suspect with all Apple's custom registers and changes to existing registers, massive changes would be 
-//   required for true system emulation, this is something worth considering but not here, not right now.
+//   Apple has custom cores that have some special functionality that might be worth emulating, right now I've
+//   edited the cortex-a72/etc. definitions for the aarch64 code to have stub Apple registers, along with a
+//   non-matching CPU type, this is enough to get through m1n1's writes to these registers although they have
+//   no actual functionality. I suspect most of these we can just have do nothing because it looks ilke they
+//   are just ways to poke at unemulated microarchitectural state, although m1n1's code does suggest some of
+//   them might affect things like interrupts which might actually require emulation
 //
 // One idea for this is to do what's suggested below and literally pull in a device tree (converted to
 // not apple format) then use that to layout all the devices, creating stub regions of unimplemented registers
@@ -148,18 +150,35 @@ static void apple_m1_init(MachineState *machine)
     *(uint64_t*) ((uint8_t*) boot_args_data + 16) = memmap[VIRT_MEM].base;    
     // set the memory size to the correct value
     *(uint64_t*) ((uint8_t*) boot_args_data + 24) = memmap[VIRT_MEM].size;
-    // Set the end of kernel address to like some value far after m1n1
+    // Set the end of kernel address to like some value far after m1n1 (fixes heap code)
     // XXX: This especially of all things will need fixing
     *(uint64_t*) ((uint8_t*) boot_args_data + 32) = memmap[VIRT_MEM].base+0x40000;
+    // This sets us up with a device tree at 0x1000 which defines nothing
+    *(uint64_t*) ((uint8_t*) boot_args_data + 96) = 0x1000;             // address
+    *(uint32_t*) ((uint8_t*) boot_args_data + 104) = sizeof(uint32_t)*2; // size
+    
     // Setup the data to be written into ROM before the CPU boots
     rom_add_blob_fixed("boot-args", boot_args_data, 0x300, memmap[BOOT_ARGS].base);
+    
+    // Stupid stub device tree because m1n1 assumes the size will be greater than 0 without checking
+    // Defines zero properties and zero children
+    uint32_t adt_header[2] = {0x0, 0x0};
+    // Write it to 0x1000 which should be past the boot_args
+    // XXX: check this
+    rom_add_blob_fixed("device-tree", adt_header, sizeof(uint32_t)*2, 0x1000);
+
     // Free our temp data, (the previous step copies it elsewhere)
     g_free(boot_args_data);
 
     m1_boot_info.loader_start = memmap[VIRT_MEM].base;
     m1_boot_info.ram_size = machine->ram_size;
 
+    // XXX: This only works with a raw m1n1 elf because of patches to the laod elf that will break other users
+    //      should be replaced with a very simple loader for mach-o's or a seperate firmware bootloader
+    //      support for the firmware bootloader path would need to be added I think to do this right?
+    //      (TODO: look at the raspbery pi code which needs to do something similar)
     arm_load_kernel(ARM_CPU(first_cpu), machine, &m1_boot_info);
+    // If this value isn't at least 0x10000, something is wrong
     printf("Entry after load: %lx\n", m1_boot_info.entry);
 }
 
