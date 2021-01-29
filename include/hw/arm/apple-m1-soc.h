@@ -4,6 +4,11 @@
 #include "qom/object.h"
 #include "target/arm/cpu.h"
 
+enum {
+    VIRT_MEM,
+    VIRT_UART,
+};
+
 #define TYPE_APPLE_M1_SOC "apple-m1-soc"
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleM1SoCState, APPLE_M1_SOC)
