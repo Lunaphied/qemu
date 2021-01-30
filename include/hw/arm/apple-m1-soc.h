@@ -11,6 +11,10 @@ enum {
     VIRT_FB,    // The m1n1 code expects a framebuffer, for now this just means to dump ram in this region
 };
 
+// The M1 has a fixed number of cores, model that
+#define APPLE_M1_FIRESTORM_CPUS 4
+#define APPLE_M1_ICESTORM_CPUS 4
+
 // We create an "m1 soc" but realistically the chip has a model, should we use that instead? this is pretty
 // high level emulation of the SoC so it might not really matter for our purposes. Probably should change it though.
 #define TYPE_APPLE_M1_SOC "apple-m1-soc"
@@ -22,7 +26,8 @@ struct AppleM1SoCState {
     DeviceState parent_obj;
 
     /*< public >*/
-    ARMCPU maincore;
+    ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
+    ARMCPU icestorm_cores[APPLE_M1_ICESTORM_CPUS];
 };
 
 #endif // HW_ARM_APPLE_M1_SOC_H

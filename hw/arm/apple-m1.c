@@ -16,6 +16,7 @@
 #include "exec/hwaddr.h"
 #include "sysemu/sysemu.h"
 #include "exec/exec-all.h"
+#include "sysemu/reset.h"
 #include "hw/arm/apple-m1-soc.h"
 
 // Notes on this file:
@@ -44,38 +45,91 @@
 // them up like this during dev (the UART is the correct address for where it is when m1n1 loads though)
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
-    [BOOT_ARGS] =           {         0x0,     0x10000},
+    [BOOT_ARGS] =           {        0x10,     0x10000},
     [VIRT_MEM] =            {     0x10000,       8*GiB},
     [VIRT_UART] =           { 0x235200000,     0x10000},
     [VIRT_FB] =             { 0x300000000,       8*GiB},
 };
 
+// XXX: Hack to make sure we insert the boot args after the device tree
+static hwaddr device_tree_end;
+
 static void apple_m1_soc_init(Object *obj) {
     AppleM1SoCState *s = APPLE_M1_SOC(obj);
 
-    // not sure if this is the best way to create a CPU core, but we definitely want to use the A72 which
-    // seems to be the fanciest ARM core that qemu supports at the moment (which is probably the most like
-    // the M1's cores)
-    object_initialize_child(obj, "maincpu", &s->maincore,
-                            ARM_CPU_TYPE_NAME("cortex-a72"));
+    // XXX: Change this to use M1 specific core types
+    for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
+        object_initialize_child(obj, "firestorm[*]", &s->firestorm_cores[i],
+                                ARM_CPU_TYPE_NAME("cortex-a72"));
+    }
+    // XXX: Change this to use M1 specific core types
+    for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
+        object_initialize_child(obj, "icestorm[*]", &s->icestorm_cores[i],
+                                ARM_CPU_TYPE_NAME("cortex-a72"));
+    }
 }
+
+// Apple M1 reset needs us to put the correct x0 register to point to our boot args
+static void handle_m1_reset(void *opaque)
+{
+    ARMCPU *cpu = ARM_CPU(opaque);
+    // TODO: More sanely seperate device_tree_end and boot args
+    // FIXME: It's possible this should be replaced by a rom region that does this
+    // while executing on the cpu
+    cpu->env.xregs[0] = device_tree_end;
+    cpu_set_pc(CPU(cpu), 0x14800);
+    // FIXME: This might not actually work at all
+    cpu->env.cp15.hcr_el2 = 0x30488000000;
+}   
 
 static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
 {
     AppleM1SoCState *s = APPLE_M1_SOC(dev);
+    //Object *obj;
     //MemoryRegion *system_mem = get_system_memory();
 
-    // Yes there's only one CPU right now. This makes testing easier and I don't have an emulated interrupt
-    // controller so I think SMP stuff would be weird (probably not impossible since SEV exists though)
-    // But in truth we'd want to model the way the smp bringup works on actual hardware so lets not waste time
-    // on it now
-    DeviceState* cpuobj = DEVICE(&s->maincore);
+    // Initialize all the cores
+    // TODO: Firestorm core 0 is the lucky one that gets to start powered up right now, however in actual hardware
+    //       all cores would have gone into a WFE type loop or setup waiting for an IPI and then WFI'd
+    // XXX: Comment above is wrong I think, it seems like actual hardware does a RISC-V like race through the same
+    //      code but one of them is specifically chosen and marked as such in the device tree and then the others
+    //      know to go into holding patterns? No clue, figure out later
+    for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
+        // TODO: Somehow set the MP id's properly
+        // TODO: Do we need to set CBAR?
+        // TODO: How about RBAR? or whatever it is
+        // TODO: Interrupt mapping
+        // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
+        // Disable CPU 
+        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), 
+                                 "start-powered-off",
+                                 i > 0, &error_abort);
+        // Set CPU features
+        // TODO: Get rid of this when M1 core type exists and that disables the feature support
+        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el3", false, &error_abort);
+        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el2", true, &error_abort);
 
-    // The apple M1 has no EL3 support but does have EL2, so these must be set for compatibility
-    qdev_prop_set_bit(cpuobj, "has_el3", false);
-    qdev_prop_set_bit(cpuobj, "has_el2", true);
+        qdev_realize(DEVICE(&s->firestorm_cores[i]), NULL, &error_abort);
+    }
+    printf("HCR EL2: %lx\n", s->firestorm_cores[0].env.cp15.hcr_el2);
+    // Now do the icestorm cores
+    for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
+        // TODO: Somehow set the MP id's properly
+        // TODO: Do we need to set CBAR?
+        // TODO: How about RBAR? or whatever it is
+        // TODO: Interrupt mapping
+        // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
+        // Disable CPU 
+        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), 
+                                 "start-powered-off",
+                                 true, &error_abort);
+        // Set CPU features
+        // TODO: Get rid of this when M1 core type exists and that disables the feature support
+        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el3", false, &error_abort);
+        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el2", true, &error_abort);
 
-    qdev_realize(DEVICE(cpuobj), NULL, &error_abort);
+        qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
+    }
 
     // XXX: This code needs to be made more generic before it could sanely be attached here
     //      also it seems serial_hd(x) is bad practice for getting the chardev, but I can't see
@@ -86,14 +140,22 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     //      we replicated it to allow setting it as a child before relization completes
     DeviceState *uart = qdev_new("exynos4210.uart");
     object_property_add_child(OBJECT(s), "uart", OBJECT(uart));
-
     qdev_prop_set_chr(uart, "chardev", serial_hd(0));
-    SysBusDevice *bus = SYS_BUS_DEVICE(uart);
-    sysbus_realize_and_unref(bus, &error_abort);
-    sysbus_mmio_map(bus, 0, memmap[VIRT_UART].base);
-    sysbus_connect_irq(bus, 0, qdev_get_gpio_in(cpuobj, ARM_CPU_IRQ));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, memmap[VIRT_UART].base);
+    
+    // currently the UART is connected directly to firestorm core 0's interrupts... odd.
+    // first_cpu is sometimes used but is that guranteed to be anything specific? Until we find out use
+    // firstorm_cores[0]
+    // FIXME: tagged
+    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
+
     // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
     //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
+
+    // FIXME: Do this properly
+    // Add a reset hook for the first core that will pull in the correct x0 reg for boot_arsg
+    qemu_register_reset(handle_m1_reset, &s->firestorm_cores[0]);
 }
 
 static void apple_m1_soc_class_init(ObjectClass *oc, void *data) { 
@@ -123,6 +185,80 @@ type_init(apple_m1_soc_register_types);
 
 static struct arm_boot_info m1_boot_info;
 
+
+// This builds an apple style device tree then inserts it into memory somewhere, 
+// TODO: Make this a lot nicer (model after the virt platform fdt builders)
+// it should be dynamic (ideally we would take an existing device tree from
+// hardware and then create the other devices using the information so contained
+static void create_apple_dt(void) {
+    struct node_header {
+        uint32_t prop_count;
+        uint32_t child_count;
+    };
+    // TODO: Put actual contents in here
+    struct node_header adt_header = {0x0, 0x0};
+    printf("Mapping device tree at: %lx\n", memmap[BOOT_ARGS].base);
+    rom_add_blob_fixed("device-tree", &adt_header, sizeof(adt_header), memmap[BOOT_ARGS].base);
+    // FIXME: I bet there's functions that help do alignment like this
+    // Until then we use this to align to the next 64 byte block
+    device_tree_end = ((sizeof(adt_header) + memmap[BOOT_ARGS].base) + 0x3F) & (~0x3F);
+}
+
+#define BOOTARGS_REVISION 0xDEAD
+#define BOOTARGS_FB_WIDTH 800
+#define BOOTARGS_FB_HEIGHT 600
+#define BOOTARGS_FB_STRIDE (BOOTARGS_FB_WIDTH*4)
+#define BOOTARGS_FB_DEPTH 30
+
+// This builds and then inserts a boot args structure like m1n1 and OS X expect
+// it then puts it into memory (I've moved it to 0x10 so that it's not set to
+// a null pointer)
+static void create_boot_args(void) {
+    struct {
+        uint16_t revision;
+        uint16_t pad0;
+        uint32_t pad1;
+        uint64_t virtual_load_base; // TODO: document if this is a load base or memory base
+        uint64_t physical_load_base;
+        uint64_t memory_size;
+        uint64_t loaded_end;        // End address of loaded binary (safe mem starts here)
+        uint64_t fb_addr;           // Framebuffer address in memory
+        uint64_t pad2;
+        uint64_t fb_stride;         // Stride (bytes per line)
+        uint64_t fb_width;
+        uint64_t fb_height;
+        uint64_t fb_depth;          // TODO: Extract what real hardware puts here
+        uint64_t pad3;
+        uint64_t device_tree;
+        uint32_t device_tree_size;
+        char cmdline[608];
+        uint64_t flags;
+        uint64_t unknown;
+    } bootargs;
+    bootargs.revision = 0xdead;
+    bootargs.virtual_load_base = memmap[VIRT_MEM].base;
+    bootargs.physical_load_base = memmap[VIRT_MEM].base;
+    bootargs.memory_size = memmap[VIRT_MEM].size;
+    bootargs.loaded_end = memmap[VIRT_MEM].base + 0x40000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
+    bootargs.fb_addr = memmap[VIRT_FB].base;
+    bootargs.fb_stride = BOOTARGS_FB_STRIDE;
+    bootargs.fb_width = BOOTARGS_FB_WIDTH;
+    bootargs.fb_height = BOOTARGS_FB_HEIGHT;
+    bootargs.fb_depth = BOOTARGS_FB_DEPTH;
+
+    // FIXME: There's got to be a better way of doing it than this. Maybe a property or something? Maybe not?
+    bootargs.device_tree = memmap[BOOT_ARGS].base;
+    bootargs.device_tree_size = device_tree_end - memmap[BOOT_ARGS].base;
+
+    char buf[] ="no cmdline lol";
+    memset(bootargs.cmdline, 0, sizeof(bootargs.cmdline));
+    memcpy(bootargs.cmdline, buf, sizeof(buf)); // FIXME: This is stupid
+    bootargs.cmdline[sizeof(buf)] = 0x0;
+
+    printf("Mapping boot args tree at: %lx\n", device_tree_end);
+    rom_add_blob_fixed("boot-args", &bootargs, sizeof(bootargs), device_tree_end);
+}
+
 static void apple_m1_init(MachineState *machine)
 {
     AppleM1SoCState *m1;
@@ -147,54 +283,25 @@ static void apple_m1_init(MachineState *machine)
     memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
     memory_region_add_subregion(sysmem, memmap[VIRT_MEM].base, machine->ram);
 
-    // Used to add bootargs, yes I know this memory leaks but it doesn't matter
-    // at the moment, oddly adding the blob doesn't actually add it into the memory map
-    // which is annoying
-    void* boot_args_data = g_new0(uint8_t, 0x300);
-    // set the revision to something noticable
-    *(uint16_t*) ((uint8_t*) boot_args_data + 0) = 0xdead;
-    // Set virtual and physical base to the same value since virtual load wasn't performed
-    *(uint64_t*) ((uint8_t*) boot_args_data + 8) = memmap[VIRT_MEM].base;
-    *(uint64_t*) ((uint8_t*) boot_args_data + 16) = memmap[VIRT_MEM].base;    
-    // set the memory size to the correct value
-    *(uint64_t*) ((uint8_t*) boot_args_data + 24) = memmap[VIRT_MEM].size;
-    // Set the end of kernel address to like some value far after m1n1 (fixes heap code)
-    // XXX: This especially of all things will need fixing
-    *(uint64_t*) ((uint8_t*) boot_args_data + 32) = memmap[VIRT_MEM].base+0x40000;
-    // Point the framebuffer somewhere safe
-    *(uint64_t*) ((uint8_t*) boot_args_data + 40) = memmap[VIRT_FB].base;
-    // Give it a meaningful stride, width, height and depth
-    *(uint64_t*) ((uint8_t*) boot_args_data + 56) = 4*800;  // stride
-    *(uint64_t*) ((uint8_t*) boot_args_data + 64) = 800;    // width
-    *(uint64_t*) ((uint8_t*) boot_args_data + 72) = 600;    // height
-    *(uint64_t*) ((uint8_t*) boot_args_data + 80) = 30;     // depth
-    // This sets us up with a device tree at 0x1000 which defines nothing
-    *(uint64_t*) ((uint8_t*) boot_args_data + 96) = 0x1000;             // address
-    *(uint32_t*) ((uint8_t*) boot_args_data + 104) = sizeof(uint32_t)*2; // size
-    
-    // Setup the data to be written into ROM before the CPU boots
-    rom_add_blob_fixed("boot-args", boot_args_data, 0x300, memmap[BOOT_ARGS].base);
-
-    // Stupid stub device tree because m1n1 assumes the size will be greater than 0 without checking
-    // Defines zero properties and zero children
-    uint32_t adt_header[2] = {0x0, 0x0};
-    // Write it to 0x1000 which should be past the boot_args
-    // XXX: check this
-    rom_add_blob_fixed("device-tree", adt_header, sizeof(uint32_t)*2, 0x1000);
-
-    // Free our temp data, (the previous step copies it elsewhere)
-    g_free(boot_args_data);
+    // Add apple flavored device tree
+    create_apple_dt();
+    // Add boot args
+    create_boot_args();
 
     m1_boot_info.loader_start = memmap[VIRT_MEM].base;
     m1_boot_info.ram_size = machine->ram_size;
+
+    // TODO: Replace this with a stubbed bootloader that loads the registers peroply
+    // and loads a kernel blob into memory and then jumps into that kernel blob
+    // we can probably implement enough macho parsing to grab the entry point
 
     // XXX: This only works with a raw m1n1 elf because of patches to the laod elf that will break other users
     //      should be replaced with a very simple loader for mach-o's or a seperate firmware bootloader
     //      support for the firmware bootloader path would need to be added I think to do this right?
     //      (TODO: look at the raspbery pi code which needs to do something similar)
-    arm_load_kernel(ARM_CPU(first_cpu), machine, &m1_boot_info);
+    // arm_load_kernel(ARM_CPU(first_cpu), machine, &m1_boot_info);
     // If this value isn't at least 0x10000, something is wrong
-    printf("Entry after load: %lx\n", m1_boot_info.entry);
+    //printf("Entry after load: %lx\n", m1_boot_info.entry);
 }
 
 static void apple_m1_machine_init(MachineClass *mc)
@@ -208,6 +315,9 @@ static void apple_m1_machine_init(MachineClass *mc)
     mc->desc = "Apple M1 Mac Mini";
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a57");
     mc->block_default_type = IF_SD;
+    mc->min_cpus = 8;
+    mc->max_cpus = 8;
+    mc->default_cpus = 8;
 }
 
 DEFINE_MACHINE("apple-m1", apple_m1_machine_init)
