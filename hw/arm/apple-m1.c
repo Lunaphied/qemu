@@ -68,6 +68,8 @@ static void apple_m1_soc_init(Object *obj) {
         object_initialize_child(obj, "icestorm[*]", &s->icestorm_cores[i],
                                 ARM_CPU_TYPE_NAME("cortex-a72"));
     }
+    object_initialize_child(obj, "framebudffer", &s->fb,
+		    		TYPE_APPLE_M1_FB);
 }
 
 // Apple M1 reset needs us to put the correct x0 register to point to our boot args
@@ -77,12 +79,16 @@ static void handle_m1_reset(void *opaque)
     // TODO: More sanely seperate device_tree_end and boot args
     // FIXME: It's possible this should be replaced by a rom region that does this
     // while executing on the cpu
+    
+    // INFO: This way of doing things is actually done on several other machines mostly
+    // not ARM ones though, but using the reset vector like this is fair, most of them
+    // load a bootrom bios into a fixed location, setup the registers to a loaded main binary
+    // image (or just let the bootrom work) and then set the PC to the entrypoint
     cpu_reset(CPU(cpu));
     cpu->env.xregs[0] = device_tree_end;
     cpu_set_pc(CPU(cpu), 0x14800);
     // FIXME: This might not actually work at all
     cpu->env.cp15.hcr_el2 = 0x30488000000;
-    printf("Reset DAIF: %lx\n", cpu->env.daif);
 }   
 
 static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
@@ -133,6 +139,15 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
 
         qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
     }
+
+    // Framebuffer init
+    // TODO: Set framebuffer memory area size as a property and connect it to the memory map here
+    // (This is all temporary until the mapping system is understood enough to have framebuffer be
+    // just another part of normal RAM with a default mapping) (which I also don't know how to setup
+    // properly in qemu but VGA PCI stuff might be similar)
+    AppleM1FBState *fb = &s->fb;
+    sysbus_realize(SYS_BUS_DEVICE(fb), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(fb), 0, memmap[VIRT_FB].base);
 
     // XXX: This code needs to be made more generic before it could sanely be attached here
     //      also it seems serial_hd(x) is bad practice for getting the chardev, but I can't see
@@ -280,11 +295,12 @@ static void apple_m1_init(MachineState *machine)
     memory_region_init_rom(boot_args, NULL, "boot-args", memmap[BOOT_ARGS].size, &error_abort);
     memory_region_add_subregion(sysmem, memmap[BOOT_ARGS].base, boot_args);
 
+    // XXX: FB stuff was implemented and moved into soc this isn't needed anymore as far as I know
     // Again this should probably go in the SoC state struct or the machine struct (probably the SoC since it's all)
     // technically part of the M1 itself unlike most things (raspi SoC is again a good reference)
-    MemoryRegion *fb_mem = g_new0(MemoryRegion, 1);
-    memory_region_init_ram(fb_mem, NULL, "framebuffer", memmap[VIRT_FB].size, &error_abort);
-    memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
+    // MemoryRegion *fb_mem = g_new0(MemoryRegion, 1);
+    //memory_region_init_ram(fb_mem, NULL, "framebuffer", memmap[VIRT_FB].size, &error_abort);
+    //memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
     memory_region_add_subregion(sysmem, memmap[VIRT_MEM].base, machine->ram);
 
     // Add apple flavored device tree

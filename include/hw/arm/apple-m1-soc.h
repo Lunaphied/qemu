@@ -3,6 +3,7 @@
 
 #include "qom/object.h"
 #include "target/arm/cpu.h"
+#include "hw/display/apple-m1-fb.h"
 
 enum {
     VIRT_MEM,   // A block of ram
@@ -26,8 +27,12 @@ struct AppleM1SoCState {
     DeviceState parent_obj;
 
     /*< public >*/
+    /* Cores */
     ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
     ARMCPU icestorm_cores[APPLE_M1_ICESTORM_CPUS];
+
+    /* SoC devices */
+    AppleM1FBState fb;
 };
 
 #endif // HW_ARM_APPLE_M1_SOC_H
