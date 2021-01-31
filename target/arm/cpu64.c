@@ -98,6 +98,12 @@ static const ARMCPRegInfo cortex_a72_a57_a53_cp_reginfo[] = {
     { .name = "APPLE_HID7", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 7, .opc2 = 0,
       .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_ERROR_STATUS", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 8, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 9, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     // These are min EL2 (max level for M1) so we know they must be EL2 registers
     { .name = "APPLE_MISC1_EL2", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 4, .opc2 = 0,
@@ -253,6 +259,7 @@ static void aarch64_a72_initfn(Object *obj)
     cpu->isar.id_aa64dfr0 = 0x10305106;
     cpu->isar.id_aa64isar0 = 0x00011120;
     cpu->isar.id_aa64mmfr0 = 0x00001124;
+    cpu->isar.id_aa64mmfr1 = 0x00000100; /* Enable VH bits for M1, this controls QEMU */
     cpu->isar.dbgdidr = 0x3516d000;
     cpu->clidr = 0x0a200023;
     cpu->ccsidr[0] = 0x701fe00a; /* 32KB L1 dcache */

@@ -18,6 +18,7 @@
 #include "exec/exec-all.h"
 #include "sysemu/reset.h"
 #include "hw/arm/apple-m1-soc.h"
+#include "hw/misc/unimp.h"
 
 // Notes on this file:
 // - This file doesn't actually represent the M1 very well, it's more a platform designed and focused around m1n1
@@ -76,10 +77,12 @@ static void handle_m1_reset(void *opaque)
     // TODO: More sanely seperate device_tree_end and boot args
     // FIXME: It's possible this should be replaced by a rom region that does this
     // while executing on the cpu
+    cpu_reset(CPU(cpu));
     cpu->env.xregs[0] = device_tree_end;
     cpu_set_pc(CPU(cpu), 0x14800);
     // FIXME: This might not actually work at all
     cpu->env.cp15.hcr_el2 = 0x30488000000;
+    printf("Reset DAIF: %lx\n", cpu->env.daif);
 }   
 
 static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
@@ -149,12 +152,13 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // firstorm_cores[0]
     // FIXME: tagged
     sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
-
+    // This almost certainly the watchdog but it's easier to stub it here
+    create_unimplemented_device("watchdog?", 0x23B102000, 0x10);
     // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
     //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
 
     // FIXME: Do this properly
-    // Add a reset hook for the first core that will pull in the correct x0 reg for boot_arsg
+    // Add a reset hook for the first core that will pull in the correct x0 reg for boot_args
     qemu_register_reset(handle_m1_reset, &s->firestorm_cores[0]);
 }
 
@@ -239,7 +243,7 @@ static void create_boot_args(void) {
     bootargs.virtual_load_base = memmap[VIRT_MEM].base;
     bootargs.physical_load_base = memmap[VIRT_MEM].base;
     bootargs.memory_size = memmap[VIRT_MEM].size;
-    bootargs.loaded_end = memmap[VIRT_MEM].base + 0x40000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
+    bootargs.loaded_end = memmap[VIRT_MEM].base + 0x100000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
     bootargs.fb_addr = memmap[VIRT_FB].base;
     bootargs.fb_stride = BOOTARGS_FB_STRIDE;
     bootargs.fb_width = BOOTARGS_FB_WIDTH;
