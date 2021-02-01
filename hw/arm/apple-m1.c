@@ -169,7 +169,6 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // the correct solution is probably to have m1n1 specifically enable the FIFO or add a pre-m1n1 boot stub
     // to initialize the registers to the values needed by iboot (an iboot stub)
     sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, memmap[VIRT_UART].base);
-    
     // currently the UART is connected directly to firestorm core 0's interrupts... odd.
     // first_cpu is sometimes used but is that guranteed to be anything specific? Until we find out use
     // firstorm_cores[0]
@@ -178,14 +177,26 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // hardware this isn't a concern.
     // XXX: pending AIC
     //sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
+    /* XXX: Second UART for linux */
+    /* FIXME: This just doesn't work, it's missing properties or something, also it relies on a patched device tree
+     * being provided that defines the device, lets just not bother
+     */
+    /*
+    if (serial_hd(1)) {
+        uart = qdev_new("exynos4210.uart");
+        object_property_add_child(OBJECT(s), "linux-uart", OBJECT(uart));
+        qdev_prop_set_chr(uart, "chardev", serial_hd(1));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
+        sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, 0x235300000);
+    }
+    */
     // FIXME: Do them all and connect to AIC or whatever
     // Connect a generic ARM timer to FIQ for the interrupts we need (It's HYP because linux uses the hypervisor but I think all the timers should be connected to FIQ for the M1)
     qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_HYP,
 		          qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_FIQ));
-    // This almost certainly the watchdog but it's easier to stub it here
-    create_unimplemented_device("watchdog?", 0x23B102000, 0x10);
-    // This is probably the AIC stub it here for linux writes to not error
-    create_unimplemented_device("AIC?", 0x23B103000, 0x10000); // given how close this is to the AIC I bet they're the same peripheral internally
+    // TODO: Add to memory map, this is the AIC and watchdog space I think, it's not matching the dev trees I
+    // have though...
+    create_unimplemented_device("AIC/Watchdog", 0x23B100000, 0x10000); // given how close this is to the AIC I bet they're the same peripheral internally
     // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
     //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
 
