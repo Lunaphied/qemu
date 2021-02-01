@@ -68,7 +68,7 @@ static void apple_m1_soc_init(Object *obj) {
         object_initialize_child(obj, "icestorm[*]", &s->icestorm_cores[i],
                                 ARM_CPU_TYPE_NAME("cortex-a72"));
     }
-    object_initialize_child(obj, "framebudffer", &s->fb,
+    object_initialize_child(obj, "framebuffer", &s->fb,
 		    		TYPE_APPLE_M1_FB);
 }
 
@@ -87,7 +87,9 @@ static void handle_m1_reset(void *opaque)
     cpu_reset(CPU(cpu));
     cpu->env.xregs[0] = device_tree_end;
     cpu_set_pc(CPU(cpu), memmap[VIRT_MEM].base+0x4800);
-    // FIXME: This might not actually work at all
+    // FIXME: This seems like a crazy way to initialize this but there's no easy
+    // way to do it at the CPU level because CPU reset will reset this to 0.
+    // There might be a better way if I look deeper though but this works okay for now
     cpu->env.cp15.hcr_el2 = 0x30488000000;
 }   
 
@@ -317,8 +319,25 @@ static void apple_m1_init(MachineState *machine)
     // Add boot args
     create_boot_args();
 
+    // XXX: These are unused but we leave temporarily 
     m1_boot_info.loader_start = memmap[VIRT_MEM].base;
     m1_boot_info.ram_size = machine->ram_size;
+
+    /* This is for loading M1N1 which acts as a sort of replacement firmware */
+    /* We will want to do some sort of stub firmware loader first before M1N1
+     * to setup the registers and boot args it expects, but for now we abuse
+     * the reset handler and use ROM regions (we want to replace these with RAM
+     * that reloads on CPU reset or something)
+     */
+    if (machine->firmware) {
+        printf("Found firmware: %s\n", machine->firmware);
+        if (load_image_targphys(machine->firmware, memmap[VIRT_MEM].base,
+                                memmap[VIRT_MEM].size) < 0) {
+            error_report("Failed to load firmware from %s", machine->firmware);
+            exit(1);
+        }
+    }
+
 
     // TODO: Replace this with a stubbed bootloader that loads the registers peroply
     // and loads a kernel blob into memory and then jumps into that kernel blob
