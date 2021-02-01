@@ -76,7 +76,7 @@ typedef struct Exynos4210UartReg {
 static const Exynos4210UartReg exynos4210_uart_regs[] = {
     {"ULCON",    ULCON,    0x00000000},
     {"UCON",     UCON,     0x00003000},
-    {"UFCON",    UFCON,    0x00000000},
+    {"UFCON",    UFCON,    0x00000001}, /* XXX: M1 reset with FIFO */
     {"UMCON",    UMCON,    0x00000000},
     {"UTRSTAT",  UTRSTAT,  0x00000006}, /* RO */
     {"UERSTAT",  UERSTAT,  0x00000000}, /* RO */
