@@ -159,6 +159,7 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     DeviceState *uart = qdev_new("exynos4210.uart");
     object_property_add_child(OBJECT(s), "uart", OBJECT(uart));
     qdev_prop_set_chr(uart, "chardev", serial_hd(0));
+    qdev_prop_set_uint32(uart, "rx-size", 0x10000); // Give the serial port an insane buffer to speed up code loads
     sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, memmap[VIRT_UART].base);
     
@@ -169,6 +170,8 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
     // This almost certainly the watchdog but it's easier to stub it here
     create_unimplemented_device("watchdog?", 0x23B102000, 0x10);
+    // This is probably the AIC stub it here for linux writes to not error
+    create_unimplemented_device("AIC?", 0x23B103000, 0x10000); // given how close this is to the AIC I bet they're the same peripheral internally
     // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
     //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
 
