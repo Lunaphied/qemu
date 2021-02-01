@@ -277,7 +277,7 @@ static void aarch64_a72_initfn(Object *obj)
     cpu->isar.id_aa64mmfr1 = 0x11212100; /* Enable VH bits for M1, this controls QEMU */
     cpu->isar.id_aa64mmfr2 = 0x1201111100001011;
     cpu->isar.dbgdidr = 0x3516d000;
-    cpu->clidr = 0x0a200023;
+    cpu->clidr = 0x2000023; /* XXX: M1: FWB supported no dcache clean to maintain icache coherancy */
     cpu->ccsidr[0] = 0x701fe00a; /* 32KB L1 dcache */
     cpu->ccsidr[1] = 0x201fe012; /* 48KB L1 icache */
     cpu->ccsidr[2] = 0x707fe07a; /* 1MB L2 cache */
