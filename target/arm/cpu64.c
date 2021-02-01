@@ -104,12 +104,24 @@ static const ARMCPRegInfo cortex_a72_a57_a53_cp_reginfo[] = {
     { .name = "L2C_UNKNOWN1", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 9, .opc2 = 0,
       .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN2?", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 10, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN3?", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 2, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     // These are min EL2 (max level for M1) so we know they must be EL2 registers
     { .name = "APPLE_MISC1_EL2", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 4, .opc2 = 0,
       .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     { .name = "APPLE_MISC2_EL2", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 5, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_MISC3_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 0, .opc2 = 2,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_MISC4_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 2, .opc2 = 0,
       .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     REGINFO_SENTINEL
 };
@@ -231,7 +243,8 @@ static void aarch64_a72_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_AARCH64);
     set_feature(&cpu->env, ARM_FEATURE_CBAR_RO);
     set_feature(&cpu->env, ARM_FEATURE_EL2);
-    set_feature(&cpu->env, ARM_FEATURE_EL3);
+    // TODO: Move to Apple M1 core type
+    /* set_feature(&cpu->env, ARM_FEATURE_EL3); */
     set_feature(&cpu->env, ARM_FEATURE_PMU);
     cpu->midr = 0x410fd083;
     cpu->revidr = 0x00000000;
@@ -258,8 +271,11 @@ static void aarch64_a72_initfn(Object *obj)
     cpu->isar.id_aa64pfr0 = 0x00002222;
     cpu->isar.id_aa64dfr0 = 0x10305106;
     cpu->isar.id_aa64isar0 = 0x00011120;
-    cpu->isar.id_aa64mmfr0 = 0x00001124;
-    cpu->isar.id_aa64mmfr1 = 0x00000100; /* Enable VH bits for M1, this controls QEMU */
+    /* XXX: Changed to match M1 stuff */
+    /* TODO: Figure out what these bits do! */
+    cpu->isar.id_aa64mmfr0 = 0x12120f100001;
+    cpu->isar.id_aa64mmfr1 = 0x11212100; /* Enable VH bits for M1, this controls QEMU */
+    cpu->isar.id_aa64mmfr2 = 0x1201111100001011;
     cpu->isar.dbgdidr = 0x3516d000;
     cpu->clidr = 0x0a200023;
     cpu->ccsidr[0] = 0x701fe00a; /* 32KB L1 dcache */

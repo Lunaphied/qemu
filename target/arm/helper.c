@@ -8617,7 +8617,13 @@ void define_one_arm_cp_reg_with_opaque(ARMCPU *cpu,
             break;
         case 6:
             /* min_EL EL3 */
-            mask = PL3_RW;
+	    /* XXX: Apparently if you don't implement EL3 it degrades to EL2 */
+	    /* TODO: add the same thing for degrading if EL2 isn't supported */
+	    if (!arm_feature(&cpu->env, ARM_FEATURE_EL3)) {
+                mask = PL2_RW;
+            } else {
+                mask = PL3_RW;
+            }
             break;
         case 7:
             /* min_EL EL1, secure mode only (we don't check the latter) */

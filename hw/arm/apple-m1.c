@@ -47,9 +47,9 @@
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
     [BOOT_ARGS] =           {        0x10,     0x10000},
-    [VIRT_MEM] =            {     0x10000,       8*GiB},
     [VIRT_UART] =           { 0x235200000,     0x10000},
     [VIRT_FB] =             { 0x300000000,       8*GiB},
+    [VIRT_MEM] =            { 0x800000000,       8*GiB},
 };
 
 // XXX: Hack to make sure we insert the boot args after the device tree
@@ -86,7 +86,7 @@ static void handle_m1_reset(void *opaque)
     // image (or just let the bootrom work) and then set the PC to the entrypoint
     cpu_reset(CPU(cpu));
     cpu->env.xregs[0] = device_tree_end;
-    cpu_set_pc(CPU(cpu), 0x14800);
+    cpu_set_pc(CPU(cpu), memmap[VIRT_MEM].base+0x4800);
     // FIXME: This might not actually work at all
     cpu->env.cp15.hcr_el2 = 0x30488000000;
 }   
@@ -115,7 +115,8 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
                                  i > 0, &error_abort);
         // Set CPU features
         // TODO: Get rid of this when M1 core type exists and that disables the feature support
-        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el3", false, &error_abort);
+	// Moved EL3 disable to core definition
+        // object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el3", false, &error_abort);
         object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el2", true, &error_abort);
 
         qdev_realize(DEVICE(&s->firestorm_cores[i]), NULL, &error_abort);
@@ -134,7 +135,8 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
                                  true, &error_abort);
         // Set CPU features
         // TODO: Get rid of this when M1 core type exists and that disables the feature support
-        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el3", false, &error_abort);
+	// Moved EL3 disable to core definition
+        // object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el3", false, &error_abort);
         object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el2", true, &error_abort);
 
         qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
@@ -167,7 +169,11 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // first_cpu is sometimes used but is that guranteed to be anything specific? Until we find out use
     // firstorm_cores[0]
     // FIXME: tagged
-    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
+    //sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
+    // FIXME: Do them all and connect to AIC or whatever
+    // Connect a generic ARM timer to FIQ for the interrupts we need
+    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_HYP,
+		          qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_FIQ));
     // This almost certainly the watchdog but it's easier to stub it here
     create_unimplemented_device("watchdog?", 0x23B102000, 0x10);
     // This is probably the AIC stub it here for linux writes to not error
