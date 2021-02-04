@@ -16,13 +16,12 @@ enum {
 #define APPLE_M1_FIRESTORM_CPUS 4
 #define APPLE_M1_ICESTORM_CPUS 4
 
-// We create an "m1 soc" but realistically the chip has a model, should we use that instead? this is pretty
-// high level emulation of the SoC so it might not really matter for our purposes. Probably should change it though.
-#define TYPE_APPLE_M1_SOC "apple-m1-soc"
+// Renamed to just apple-m1 since that seems to be the most generic SoC name
+#define TYPE_AAPL_M1 "apple-m1"
 
-OBJECT_DECLARE_SIMPLE_TYPE(AppleM1SoCState, APPLE_M1_SOC)
+OBJECT_DECLARE_SIMPLE_TYPE(AaplM1State, AAPL_M1)
 
-struct AppleM1SoCState {
+struct AaplM1State {
     /*< private >*/
     DeviceState parent_obj;
 
