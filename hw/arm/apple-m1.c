@@ -1,3 +1,11 @@
+/*
+ * Apple M1 SoC and Mac Mini board emualtion
+ * 
+ * Copyright (c) 2021 Iris Johnson <iris@modwiz.com>
+ * 
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "qemu/osdep.h"
 #include "exec/address-spaces.h"
 #include "qapi/error.h"
@@ -13,11 +21,13 @@
 #include "hw/misc/unimp.h"
 #include "hw/loader.h"
 #include "hw/boards.h"
+#include "hw/irq.h"
+#include "hw/or-irq.h"
 #include "exec/hwaddr.h"
 #include "sysemu/sysemu.h"
 #include "exec/exec-all.h"
 #include "sysemu/reset.h"
-#include "hw/arm/apple-m1-soc.h"
+#include "hw/arm/apple-m1.h"
 #include "hw/misc/unimp.h"
 
 // Notes on this file:
@@ -27,13 +37,10 @@
 // - The structure of this file is based on the other board files I could find and me making my best guess
 //   unfortunately that doesn't get you very far, and there's some not so great stuff here too just to tie
 //   it all together to get an interesting demo
-// - The "M1" is emulated as if it's an SoC containing multiple Cortex-A72 cores, that's not true in reality,
-//   Apple has custom cores that have some special functionality that might be worth emulating, right now I've
-//   edited the cortex-a72/etc. definitions for the aarch64 code to have stub Apple registers, along with a
-//   non-matching CPU type, this is enough to get through m1n1's writes to these registers although they have
-//   no actual functionality. I suspect most of these we can just have do nothing because it looks ilke they
-//   are just ways to poke at unemulated microarchitectural state, although m1n1's code does suggest some of
-//   them might affect things like interrupts which might actually require emulation
+// - The "M1" core types are sort of emulated, but actual specific features like
+//   the CP registers for fast IPIs and several of the other registers are not
+//   implemented and this will need to be fixed so code that expects a real M1
+//   doesn't get random exceptions
 //
 // One idea for this is to do what's suggested below and literally pull in a device tree (converted to
 // not apple format) then use that to layout all the devices, creating stub regions of unimplemented registers
@@ -41,33 +48,49 @@
 // code. So there's no framework, so that seems like it would be it's own project to prototype. 
 // So for now we hardcode and make a few M1 helpers
 
+#define RAMLIMIT_GB     8192
+#define RAMLIMIT_BYTES  (RAMLIMIT_GB * GiB)
+enum {
+    M1_MEM,   // A block of ram
+    M1_UART,  // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
+    M1_AIC,   // The Apple interrupt controller
+    M1_WDT,   // The M1 Watchdog timer. This is probably actually part of the AIC
+    M1_ROM,   // We setup a block of ROM to make pretend boot arguments to match what the real hardware does
+    M1_FB,    // The m1n1 code expects a framebuffer, for now this just means to dump ram in this region
+};
 // This is used in several other ARM platforms to help collect the addresses and give them meaningful names
 // during realization. These aren't correlated to the M1 hardware at all though it's just easier to set
 // them up like this during dev (the UART is the correct address for where it is when m1n1 loads though)
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
-    [BOOT_ARGS] =           {        0x10,     0x10000},
-    [VIRT_UART] =           { 0x235200000,     0x10000},
-    [VIRT_FB] =             { 0x300000000,       8*GiB},
-    [VIRT_MEM] =            { 0x800000000,       8*GiB},
+    [M1_ROM] =              {         0x0,     0x10000},
+    [M1_UART] =             { 0x235200000,     0x10000},
+    [M1_AIC] =              { 0x23B100000,     0x10000},
+    [M1_WDT] =              { 0x23D2B0000,       0x100},
+    [M1_FB] =               { 0x300000000,       8*GiB},
+    [M1_MEM] =              { 0x800000000,       8*GiB},
 };
 
-// XXX: Hack to make sure we insert the boot args after the device tree
+// TODO: Get rid of this and just handle returning the size from the boot args
+// and device create creation code, also those should be stuffed in ram that's
+// initialized at boot instead of into ROM, ROM should be tiny and used for
+// initializing stuff before jumping in
 static hwaddr device_tree_end;
 
-static void apple_m1_soc_init(Object *obj) {
-    AppleM1SoCState *s = APPLE_M1_SOC(obj);
+static void apple_m1_init(Object *obj) {
+    AppleM1State *s = APPLE_M1(obj);
 
-    // XXX: Change this to use M1 specific core types
+    // Initialize CPU cores
     for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
         object_initialize_child(obj, "firestorm[*]", &s->firestorm_cores[i],
-                                ARM_CPU_TYPE_NAME("cortex-a72"));
+                                ARM_CPU_TYPE_NAME("aapl-firestorm"));
     }
-    // XXX: Change this to use M1 specific core types
     for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
         object_initialize_child(obj, "icestorm[*]", &s->icestorm_cores[i],
-                                ARM_CPU_TYPE_NAME("cortex-a72"));
+                                ARM_CPU_TYPE_NAME("aapl-icestorm"));
     }
+    
+    // Initialize framebuffer
     object_initialize_child(obj, "framebuffer", &s->fb,
 		    		TYPE_APPLE_M1_FB);
 }
@@ -76,6 +99,8 @@ static void apple_m1_soc_init(Object *obj) {
 static void handle_m1_reset(void *opaque)
 {
     ARMCPU *cpu = ARM_CPU(opaque);
+    // TODO: Change all this logic into a blob that gets dropped into
+    //       the rom area
     // TODO: More sanely seperate device_tree_end and boot args
     // FIXME: It's possible this should be replaced by a rom region that does this
     // while executing on the cpu
@@ -86,16 +111,16 @@ static void handle_m1_reset(void *opaque)
     // image (or just let the bootrom work) and then set the PC to the entrypoint
     cpu_reset(CPU(cpu));
     cpu->env.xregs[0] = device_tree_end;
-    cpu_set_pc(CPU(cpu), memmap[VIRT_MEM].base+0x4800);
+    cpu_set_pc(CPU(cpu), memmap[M1_MEM].base+0x4800);
     // FIXME: This seems like a crazy way to initialize this but there's no easy
     // way to do it at the CPU level because CPU reset will reset this to 0.
     // There might be a better way if I look deeper though but this works okay for now
     cpu->env.cp15.hcr_el2 = 0x30488000000;
 }   
 
-static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
+static void apple_m1_realize(DeviceState *dev, Error **errp)
 {
-    AppleM1SoCState *s = APPLE_M1_SOC(dev);
+    AppleM1State *s = APPLE_M1(dev);
     //Object *obj;
     //MemoryRegion *system_mem = get_system_memory();
 
@@ -113,17 +138,11 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
         // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
         // Disable CPU 
         object_property_set_bool(OBJECT(&s->firestorm_cores[i]), 
-                                 "start-powered-off",
-                                 i > 0, &error_abort);
-        // Set CPU features
-        // TODO: Get rid of this when M1 core type exists and that disables the feature support
-	// Moved EL3 disable to core definition
-        // object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el3", false, &error_abort);
-        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), "has_el2", true, &error_abort);
-
+                                 "start-powered-off", i > 0, &error_abort);
+        // TODO: Better way?
+        qdev_prop_set_uint64(DEVICE(&s->firestorm_cores[i]), "mp-affinity", (0x101<<8)|i);
         qdev_realize(DEVICE(&s->firestorm_cores[i]), NULL, &error_abort);
     }
-    printf("HCR EL2: %lx\n", s->firestorm_cores[0].env.cp15.hcr_el2);
     // Now do the icestorm cores
     for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
         // TODO: Somehow set the MP id's properly
@@ -133,14 +152,9 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
         // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
         // Disable CPU 
         object_property_set_bool(OBJECT(&s->icestorm_cores[i]), 
-                                 "start-powered-off",
-                                 true, &error_abort);
-        // Set CPU features
-        // TODO: Get rid of this when M1 core type exists and that disables the feature support
-	// Moved EL3 disable to core definition
-        // object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el3", false, &error_abort);
-        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), "has_el2", true, &error_abort);
-
+                                 "start-powered-off", true, &error_abort);
+        // TODO: Better way?
+        qdev_prop_set_uint64(DEVICE(&s->icestorm_cores[i]), "mp-affinity", i);
         qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
     }
 
@@ -151,7 +165,7 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // properly in qemu but VGA PCI stuff might be similar)
     AppleM1FBState *fb = &s->fb;
     sysbus_realize(SYS_BUS_DEVICE(fb), &error_abort);
-    sysbus_mmio_map(SYS_BUS_DEVICE(fb), 0, memmap[VIRT_FB].base);
+    sysbus_mmio_map(SYS_BUS_DEVICE(fb), 0, memmap[M1_FB].base);
 
     // XXX: This code needs to be made more generic before it could sanely be attached here
     //      also it seems serial_hd(x) is bad practice for getting the chardev, but I can't see
@@ -168,7 +182,7 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // XXX: Currently the FIFO reset state is changed so that it's ready for FIFO usage before m1n1 starts
     // the correct solution is probably to have m1n1 specifically enable the FIFO or add a pre-m1n1 boot stub
     // to initialize the registers to the values needed by iboot (an iboot stub)
-    sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, memmap[VIRT_UART].base);
+    sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, memmap[M1_UART].base);
     // currently the UART is connected directly to firestorm core 0's interrupts... odd.
     // first_cpu is sometimes used but is that guranteed to be anything specific? Until we find out use
     // firstorm_cores[0]
@@ -177,26 +191,30 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     // hardware this isn't a concern.
     // XXX: pending AIC
     //sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
-    /* XXX: Second UART for linux */
-    /* FIXME: This just doesn't work, it's missing properties or something, also it relies on a patched device tree
-     * being provided that defines the device, lets just not bother
-     */
-    /*
-    if (serial_hd(1)) {
-        uart = qdev_new("exynos4210.uart");
-        object_property_add_child(OBJECT(s), "linux-uart", OBJECT(uart));
-        qdev_prop_set_chr(uart, "chardev", serial_hd(1));
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
-        sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, 0x235300000);
-    }
-    */
+    
     // FIXME: Do them all and connect to AIC or whatever
-    // Connect a generic ARM timer to FIQ for the interrupts we need (It's HYP because linux uses the hypervisor but I think all the timers should be connected to FIQ for the M1)
+    // Connect a generic ARM timer to FIQ for the interrupts we need
+    DeviceState *fiq_or = qdev_new(TYPE_OR_IRQ);
+    object_property_add_child(OBJECT(s), "fiq-or", OBJECT(fiq_or));
+    qdev_prop_set_uint16(fiq_or, "num-lines", 16);
+    qdev_realize_and_unref(fiq_or, NULL, &error_fatal);
+    // Connect the output to the FIQ input
+    qdev_connect_gpio_out(fiq_or, 0, 
+                          qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
+                                           ARM_CPU_FIQ));
+    // Connect all of the timers as potential FIQ inputs (this might fix linux)
+    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_PHYS,
+                          qdev_get_gpio_in(fiq_or, 0));
+    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_VIRT,
+                          qdev_get_gpio_in(fiq_or, 1));
     qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_HYP,
-		          qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_FIQ));
-    // TODO: Add to memory map, this is the AIC and watchdog space I think, it's not matching the dev trees I
-    // have though...
-    create_unimplemented_device("AIC/Watchdog", 0x23B100000, 0x10000); // given how close this is to the AIC I bet they're the same peripheral internally
+                          qdev_get_gpio_in(fiq_or, 2));
+    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_SEC,
+                          qdev_get_gpio_in(fiq_or, 3));
+    
+    // TODO: Implement
+    create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 
+    create_unimplemented_device("Watchdog", memmap[M1_WDT].base, memmap[M1_WDT].size);
     // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
     //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
 
@@ -205,30 +223,30 @@ static void apple_m1_soc_realize(DeviceState *dev, Error **errp)
     qemu_register_reset(handle_m1_reset, &s->firestorm_cores[0]);
 }
 
-static void apple_m1_soc_class_init(ObjectClass *oc, void *data) { 
+static void apple_m1_class_init(ObjectClass *oc, void *data) { 
     DeviceClass *dc = DEVICE_CLASS(oc);
 
-    dc->realize = apple_m1_soc_realize;
+    dc->realize = apple_m1_realize;
 
     // The M1 SoC is mostly a glued-to-machine component it has no meaning in other contexts
     // additionally our use of serial_hd() apparently is not good according to other comments
     dc->user_creatable = false;
 }
 
-static const TypeInfo apple_m1_soc_type_info = {
-    .name = TYPE_APPLE_M1_SOC,
+static const TypeInfo apple_m1_type_info = {
+    .name = TYPE_APPLE_M1,
     .parent = TYPE_DEVICE,
-    .instance_size = sizeof(AppleM1SoCState),
-    .instance_init = apple_m1_soc_init,
-    .class_init = apple_m1_soc_class_init,
+    .instance_size = sizeof(AppleM1State),
+    .instance_init = apple_m1_init,
+    .class_init = apple_m1_class_init,
 };
 
-static void apple_m1_soc_register_types(void)
+static void apple_m1_register_types(void)
 {
-    type_register_static(&apple_m1_soc_type_info);
+    type_register_static(&apple_m1_type_info);
 }
 
-type_init(apple_m1_soc_register_types);
+type_init(apple_m1_register_types);
 
 static struct arm_boot_info m1_boot_info;
 
@@ -303,11 +321,11 @@ static void create_apple_dt(void) {
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0};
     bufsize = sizeof(databuf);
-    printf("Mapping device tree at: %lx\n", memmap[BOOT_ARGS].base);
-    rom_add_blob_fixed("device-tree", databuf, bufsize, memmap[BOOT_ARGS].base);
+    printf("Mapping device tree at: %lx\n", memmap[M1_ROM].base);
+    rom_add_blob_fixed("device-tree", databuf, bufsize, memmap[M1_ROM].base);
     //g_free(databuf);
     // XXX: Make this use the actual size?
-    device_tree_end = QEMU_ALIGN_UP(bufsize + memmap[BOOT_ARGS].base, 64);
+    device_tree_end = QEMU_ALIGN_UP(bufsize + memmap[M1_ROM].base, 64);
 }
 
 #define BOOTARGS_REVISION 0xDEAD
@@ -342,19 +360,19 @@ static void create_boot_args(void) {
         uint64_t unknown;
     } bootargs;
     bootargs.revision = 0xdead;
-    bootargs.virtual_load_base = memmap[VIRT_MEM].base;
-    bootargs.physical_load_base = memmap[VIRT_MEM].base;
-    bootargs.memory_size = memmap[VIRT_MEM].size;
-    bootargs.loaded_end = memmap[VIRT_MEM].base + 0x100000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
-    bootargs.fb_addr = memmap[VIRT_FB].base;
+    bootargs.virtual_load_base = memmap[M1_MEM].base;
+    bootargs.physical_load_base = memmap[M1_MEM].base;
+    bootargs.memory_size = memmap[M1_MEM].size;
+    bootargs.loaded_end = memmap[M1_MEM].base + 0x100000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
+    bootargs.fb_addr = memmap[M1_FB].base;
     bootargs.fb_stride = BOOTARGS_FB_STRIDE;
     bootargs.fb_width = BOOTARGS_FB_WIDTH;
     bootargs.fb_height = BOOTARGS_FB_HEIGHT;
     bootargs.fb_depth = BOOTARGS_FB_DEPTH;
 
     // FIXME: There's got to be a better way of doing it than this. Maybe a property or something? Maybe not?
-    bootargs.device_tree = memmap[BOOT_ARGS].base;
-    bootargs.device_tree_size = device_tree_end - memmap[BOOT_ARGS].base;
+    bootargs.device_tree = memmap[M1_ROM].base;
+    bootargs.device_tree_size = device_tree_end - memmap[M1_ROM].base;
 
     char buf[] ="no cmdline lol";
     memset(bootargs.cmdline, 0, sizeof(bootargs.cmdline));
@@ -365,11 +383,11 @@ static void create_boot_args(void) {
     rom_add_blob_fixed("boot-args", &bootargs, sizeof(bootargs), device_tree_end);
 }
 
-static void apple_m1_init(MachineState *machine)
+static void m1_mac_init(MachineState *machine)
 {
-    AppleM1SoCState *m1;
+    AppleM1State *m1;
 
-    m1 = APPLE_M1_SOC(qdev_new(TYPE_APPLE_M1_SOC));
+    m1 = APPLE_M1(qdev_new(TYPE_APPLE_M1));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
     //CPU(&m1->maincore)->memory = machine->ram;
     qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
@@ -379,8 +397,8 @@ static void apple_m1_init(MachineState *machine)
 
     // doesn't this leak?
     MemoryRegion *boot_args = g_new0(MemoryRegion, 1);
-    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[BOOT_ARGS].size, &error_abort);
-    memory_region_add_subregion(sysmem, memmap[BOOT_ARGS].base, boot_args);
+    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[M1_ROM].size, &error_abort);
+    memory_region_add_subregion(sysmem, memmap[M1_ROM].base, boot_args);
 
     // XXX: FB stuff was implemented and moved into soc this isn't needed anymore as far as I know
     // Again this should probably go in the SoC state struct or the machine struct (probably the SoC since it's all)
@@ -388,7 +406,7 @@ static void apple_m1_init(MachineState *machine)
     // MemoryRegion *fb_mem = g_new0(MemoryRegion, 1);
     //memory_region_init_ram(fb_mem, NULL, "framebuffer", memmap[VIRT_FB].size, &error_abort);
     //memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
-    memory_region_add_subregion(sysmem, memmap[VIRT_MEM].base, machine->ram);
+    memory_region_add_subregion(sysmem, memmap[M1_MEM].base, machine->ram);
 
     // Add apple flavored device tree
     create_apple_dt();
@@ -396,7 +414,7 @@ static void apple_m1_init(MachineState *machine)
     create_boot_args();
 
     // XXX: These are unused but we leave temporarily 
-    m1_boot_info.loader_start = memmap[VIRT_MEM].base;
+    m1_boot_info.loader_start = memmap[M1_MEM].base;
     m1_boot_info.ram_size = machine->ram_size;
 
     /* This is for loading M1N1 which acts as a sort of replacement firmware */
@@ -407,8 +425,8 @@ static void apple_m1_init(MachineState *machine)
      */
     if (machine->firmware) {
         printf("Found firmware: %s\n", machine->firmware);
-        if (load_image_targphys(machine->firmware, memmap[VIRT_MEM].base,
-                                memmap[VIRT_MEM].size) < 0) {
+        if (load_image_targphys(machine->firmware, memmap[M1_MEM].base,
+                                memmap[M1_MEM].size) < 0) {
             error_report("Failed to load firmware from %s", machine->firmware);
             exit(1);
         }
@@ -428,9 +446,9 @@ static void apple_m1_init(MachineState *machine)
     //printf("Entry after load: %lx\n", m1_boot_info.entry);
 }
 
-static void apple_m1_machine_init(MachineClass *mc)
+static void m1_mac_machine_init(MachineClass *mc)
 {
-    mc->init = apple_m1_init;
+    mc->init = m1_mac_init;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
@@ -444,4 +462,5 @@ static void apple_m1_machine_init(MachineClass *mc)
     mc->default_cpus = 8;
 }
 
-DEFINE_MACHINE("apple-m1", apple_m1_machine_init)
+// TODO: Change this when docs can be changed
+DEFINE_MACHINE("apple-m1", m1_mac_machine_init)

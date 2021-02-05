@@ -85,44 +85,6 @@ static const ARMCPRegInfo cortex_a72_a57_a53_cp_reginfo[] = {
     { .name = "L2MERRSR",
       .cp = 15, .opc1 = 3, .crm = 15,
       .access = PL1_RW, .type = ARM_CP_CONST | ARM_CP_64BIT, .resetvalue = 0 },
-// Apple hack until we add the M1 as an actual record
-    { .name = "APPLE_HID4", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 4, .opc2 = 1,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_HID5", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 5, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_HID6", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 6, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_HID7", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 7, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "L2C_ERROR_STATUS", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 8, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "L2C_UNKNOWN1", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 9, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "L2C_UNKNOWN2?", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 10, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "L2C_UNKNOWN3?", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 2, .opc2 = 0,
-      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    // These are min EL2 (max level for M1) so we know they must be EL2 registers
-    { .name = "APPLE_MISC1_EL2", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 4, .opc2 = 0,
-      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_MISC2_EL2", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 5, .opc2 = 0,
-      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_MISC3_EL2", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 0, .opc2 = 2,
-      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
-    { .name = "APPLE_MISC4_EL2", .state = ARM_CP_STATE_AA64,
-      .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 2, .opc2 = 0,
-      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     REGINFO_SENTINEL
 };
 
@@ -243,8 +205,7 @@ static void aarch64_a72_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_AARCH64);
     set_feature(&cpu->env, ARM_FEATURE_CBAR_RO);
     set_feature(&cpu->env, ARM_FEATURE_EL2);
-    // TODO: Move to Apple M1 core type
-    /* set_feature(&cpu->env, ARM_FEATURE_EL3); */
+    set_feature(&cpu->env, ARM_FEATURE_EL3);
     set_feature(&cpu->env, ARM_FEATURE_PMU);
     cpu->midr = 0x410fd083;
     cpu->revidr = 0x00000000;
@@ -271,13 +232,9 @@ static void aarch64_a72_initfn(Object *obj)
     cpu->isar.id_aa64pfr0 = 0x00002222;
     cpu->isar.id_aa64dfr0 = 0x10305106;
     cpu->isar.id_aa64isar0 = 0x00011120;
-    /* XXX: Changed to match M1 stuff */
-    /* TODO: Figure out what these bits do! */
-    cpu->isar.id_aa64mmfr0 = 0x12120f100001;
-    cpu->isar.id_aa64mmfr1 = 0x11212100; /* Enable VH bits for M1, this controls QEMU */
-    cpu->isar.id_aa64mmfr2 = 0x1201111100001011;
+    cpu->isar.id_aa64mmfr0 = 0x00001124;
     cpu->isar.dbgdidr = 0x3516d000;
-    cpu->clidr = 0x2000023; /* XXX: M1: FWB supported no dcache clean to maintain icache coherancy */
+    cpu->clidr = 0x0a200023;
     cpu->ccsidr[0] = 0x701fe00a; /* 32KB L1 dcache */
     cpu->ccsidr[1] = 0x201fe012; /* 48KB L1 icache */
     cpu->ccsidr[2] = 0x707fe07a; /* 1MB L2 cache */
@@ -286,6 +243,144 @@ static void aarch64_a72_initfn(Object *obj)
     cpu->gic_vpribits = 5;
     cpu->gic_vprebits = 5;
     define_arm_cp_regs(cpu, cortex_a72_a57_a53_cp_reginfo);
+}
+
+// TODO: This probably will need to be specialized for firestorm/icestorm
+static const ARMCPRegInfo apple_t8103_cp_reginfo[] = {
+    // Apple hack until we add the M1 as an actual record
+    { .name = "APPLE_HID4", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 4, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_HID5", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 5, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_HID6", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 6, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_HID7", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 7, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_ERROR_STATUS", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 8, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 9, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN2?", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 10, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "L2C_UNKNOWN3?", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 2, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    // These are min EL2 (max level for M1) so we know they must be EL2 registers
+    { .name = "APPLE_MISC1_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 4, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_MISC2_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 5, .crn = 15, .crm = 5, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_MISC3_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 0, .opc2 = 2,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "APPLE_MISC4_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 2, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    REGINFO_SENTINEL
+};
+
+static const ARMCPRegInfo apple_firestorm_cp_reginfo[] = {
+    { .name = "FIRESTORM_MISC1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 4, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 0, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC3", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 1, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC4", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 3, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC5", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 9, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC6", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 11, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC7", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 14, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC8", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 15, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC9", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 11, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC10", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 1, .opc2 = 3,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC11_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 5, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC12_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 1, .opc2 = 4,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    REGINFO_SENTINEL
+};
+
+// TODO: Decide what this cpu core should actually be called and if we need to
+// specialize into firestorm/icestorm
+static void aapl_firestorm_initfn(Object *obj)
+{
+    // TODO: Is this really the best way to inherit a CPU arch? we want most
+    // of the cortex A72 definitions until we replace more of them
+    aarch64_a72_initfn(obj);
+    // FIXME: Figure out where 32 bit compat is defined and disable since these
+    // cores don't actually have that feature
+    
+    ARMCPU *cpu = ARM_CPU(obj);
+
+    cpu->dtb_compatible = "AAPL,firestorm";
+    /* Must be unset at the core level because CP registers are defined as EL3
+     * access while firestorm/icestorm lack EL3 and they are therefore
+     * downgraded to EL2 */
+    unset_feature(&cpu->env, ARM_FEATURE_EL3);
+    /* XXX: Changed to match M1 stuff */
+    /* Implementer is Apple, varient is 0, arch is 
+     * elsewhere part is firestorm */
+    cpu->midr = 0x610F0230;
+    /* TODO: Figure out what these bits do! */
+    cpu->isar.id_aa64mmfr0 = 0x12120f100001;
+    cpu->isar.id_aa64mmfr1 = 0x11212100; /* Enable VH bits for M1, this controls QEMU */
+    cpu->isar.id_aa64mmfr2 = 0x1201111100001011;
+    cpu->isar.dbgdidr = 0x3516d000;
+    cpu->clidr = 0x2000023; /* XXX: M1: FWB supported no dcache clean to maintain icache coherancy */
+    // TODO: Chagne these to match actual M1 specs
+    cpu->ccsidr[0] = 0x701fe00a; /* 32KB L1 dcache */
+    cpu->ccsidr[1] = 0x201fe012; /* 48KB L1 icache */
+    cpu->ccsidr[2] = 0x707fe07a; /* 1MB L2 cache */
+    // FIXME: this absolutely must match M1 specs otherwise code will break
+    cpu->dcz_blocksize = 4; /* 64 bytes */
+    cpu->gic_num_lrs = 4;
+    cpu->gic_vpribits = 5;
+    cpu->gic_vprebits = 5;
+    define_arm_cp_regs(cpu, apple_t8103_cp_reginfo);
+    define_arm_cp_regs(cpu, apple_firestorm_cp_reginfo);
+}
+
+// TODO: see aapl_firestorm_initfn
+static void aapl_icestorm_initfn(Object *obj)
+{
+    // TODO:
+    // This does nothing except use the right names, the ID registers are wrong
+    // and the CP registers are slightly different I think so this will need to
+    // change
+    // TODO: This is bad because we get the firestorm cp registers too...
+    aapl_firestorm_initfn(obj);
+    /* Implementer is Apple, varient is 0, arch is 
+     * elsewhere part is icestorm */
+    ARM_CPU(obj)->midr = 0x610F0220;
+    ARM_CPU(obj)->dtb_compatible = "AAPL,icestorm";
 }
 
 void arm_cpu_sve_finalize(ARMCPU *cpu, Error **errp)
@@ -804,6 +899,8 @@ static const ARMCPUInfo aarch64_cpus[] = {
     { .name = "cortex-a57",         .initfn = aarch64_a57_initfn },
     { .name = "cortex-a53",         .initfn = aarch64_a53_initfn },
     { .name = "cortex-a72",         .initfn = aarch64_a72_initfn },
+    { .name = "aapl-firestorm",     .initfn = aapl_firestorm_initfn },
+    { .name = "aapl-icestorm",      .initfn = aapl_icestorm_initfn },
     { .name = "max",                .initfn = aarch64_max_initfn },
 };
 
