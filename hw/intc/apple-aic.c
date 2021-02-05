@@ -38,6 +38,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/irq.h"
 #include "hw/intc/apple-aic.h"
 
 /* TODO: Add tracing */
@@ -91,6 +92,41 @@
 #define AIC_IRQ_HW  (1<<0)
 #define AIC_IRQ_IPI (1<<2)
 
+/* HACK: bad bad bad */
+static uint32_t current_reason;
+
+/* Handle updating and initiating IRQs after applying masks */
+static void aic_update_irq(AppleAICState *s, int n)
+{
+    /* TODO: This way of handling things is common but does
+     * other code pass in the IRQ in question?
+     */
+    
+    /* TODO: Figure out priority between IPIs and HW IRQs */
+    
+    uint32_t valid_ipis = s->ipi_pending & ~(s->ipi_mask);
+    if (valid_ipis) {
+        printf("valid IPIs were: %0x\n", valid_ipis);
+    }
+    // TODO: Set reason here and hope that's the one when
+    // we raise the IRQ?
+    // TODO: Handle for each bit better
+    /* IPI handling, both setting and unsetting */
+    for (int i = 0; i < 8; i++) {
+        if (valid_ipis & (1<<i)) {
+            /* Mask it first */
+            s->ipi_mask |= 1<<i;
+            /* HACK */
+            current_reason = AIC_IRQ_IPI;
+            printf("Raising IRQ %d\n", i);
+            qemu_irq_raise(s->irq_out[i]);
+        } else {
+            /* Level triggered, should lower if unset */
+            qemu_irq_lower(s->irq_out[i]);
+        }
+    }
+}
+
 /* TODO MMIO for real, each type of IO region should probably be split */
 static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -102,13 +138,17 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* TODO: Link the CPUs back here so we can return who we are? */
         return 0;
     case AIC_IRQ_REASON: /* AIC_IRQ_REASON */
+    {
         /* Reading this also handles acking an IRQ */
         
         /* TODO: Keep track of reasons such that we can tie them back
          * when this is read, (we need the current CPU doing the read
          * to do this
          */
-        return AIC_IRQ_HW;
+        uint32_t old_reason = current_reason;
+        current_reason = 0;
+        return old_reason;
+    }
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
         return s->irq_dist[offset - AIC_DIST];
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
@@ -145,29 +185,45 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
         /* TODO: This would have to raise the IRQ line */
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
         /* TODO: And this would have to lower it if HW isn't
          * driving it (so we need an OR effectively)
          */
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
         s->irq_mask[(offset - AIC_MASK_SET)/32] |= val & 0xFFFFFFFF;
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
         s->irq_mask[(offset - AIC_MASK_CLEAR)/32] &= ~(val & 0xFFFFFFFF);
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_IPI_FLAG_SET:
         s->ipi_pending |= (val & 0xFFFFFFFF);
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_IPI_FLAG_CLEAR:
         s->ipi_pending &= ~(val & 0xFFFFFFFF);
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_IPI_MASK_SET: 
         s->ipi_mask |= (val & 0xFFFFFFFF);
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     case AIC_IPI_MASK_CLEAR:
         s->ipi_mask &= ~(val & 0xFFFFFFFF);
+        // TODO: proper irq input
+        aic_update_irq(s, 0);
         break;
     default:
         printf("aic_mem_write: Unhandled write of %0lx to @%0lx of size=%d\n",
@@ -197,8 +253,7 @@ static void aic_irq_handler(void *opaque, int n, int level)
          * an inline function (inline functions seem cleaner */
         s->irq_pending[n/32] |= n & 0x1F;
     }
-    /* TODO: most things have an update_irq method to process irqs
-     * after a change is handled specifically */
+    aic_update_irq(s, n);
 }
 
 static void apple_aic_realize(DeviceState *dev, Error **errp)
