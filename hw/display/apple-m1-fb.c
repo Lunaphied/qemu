@@ -13,6 +13,20 @@
 #include "framebuffer.h"
 #include "hw/display/apple-m1-fb.h"
 
+/**
+ * apple_m1_fb_30_to_24: return a color converted from 10 bit XRGB to 8 bit XRGB
+ * @color: Packed 30bit XRGB color from framebuffer
+ */
+static inline uint32_t apple_m1_fb_30_to_24(uint32_t color)
+{
+    /* These drop the lower 2 bits since QEMU doesn't support 10 bit color
+     * surfaces */
+    uint32_t r = (color >> 22) & 0xFF;
+    uint32_t g = (color >> 12) & 0xFF;
+    uint32_t b = (color >> 2) & 0xFF;
+    return (r << 16) | (g << 8) | b;
+}
+
 static void apple_m1_fb_draw_row(void *opaque, uint8_t *dest, const uint8_t *src,
                                  int width, int pitch)
 {
@@ -27,12 +41,6 @@ static void apple_m1_fb_draw_row(void *opaque, uint8_t *dest, const uint8_t *src
             dest[i+1] = (color >> 8) & 0xFF;
             dest[i+2] = (color >> 16) & 0xFF;
             dest[i+3] = (color >> 24) & 0xFF;
-            //dest[i] = 0xFF;
-            //dest[i+3] = 0xFF;
-            //dest[i] = src[i];
-            //dest[i+1] = src[i+1];
-            //dest[i+2] = src[i+2];
-            //dest[i+3] = src[i+3];
     }
 }
 
@@ -74,6 +82,7 @@ static void apple_m1_fb_realize(DeviceState *dev, Error **errp)
 {
     AppleM1FBState *s = APPLE_M1_FB(dev);
     
+    /* FIXME: This needs to be updated to use a resizable region */
     memory_region_init_ram(&s->vram, OBJECT(dev), "vram", 800*600*4,
                            &error_abort);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->vram);
