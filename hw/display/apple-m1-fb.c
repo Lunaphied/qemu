@@ -1,3 +1,11 @@
+/*
+ * Apple M1 SoC Framebuffer Emulation
+ * 
+ * Copyright (c) 2021 Iris Johnson <iris@modwiz.com>
+ * 
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "qemu/osdep.h"
 #include "qom/object.h"
 #include "ui/console.h"

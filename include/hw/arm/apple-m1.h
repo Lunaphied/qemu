@@ -1,5 +1,5 @@
 /*
- * Apple M1 SoC and Mac Mini board emualtion
+ * Apple M1 SoC and Mac Mini board emulation
  * 
  * Copyright (c) 2021 Iris Johnson <iris@modwiz.com>
  * 

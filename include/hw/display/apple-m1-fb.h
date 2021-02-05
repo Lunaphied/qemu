@@ -1,3 +1,10 @@
+/*
+ * Apple M1 SoC Framebuffer Emulation
+ * 
+ * Copyright (c) 2021 Iris Johnson <iris@modwiz.com>
+ * 
+ * SPDX-License-Identifier: MIT
+ */
 #ifndef APPLE_M1_FB_H
 #define APPLE_M1_FB_H
 
