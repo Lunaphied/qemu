@@ -319,6 +319,7 @@ config ALLWINNER_H3
 config APPLE_M1
     bool
     select EXYNOS4 # UART
+    select APPLE_AIC
 
 config RASPI
     bool

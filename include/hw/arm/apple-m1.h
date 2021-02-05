@@ -12,6 +12,7 @@
 #include "qom/object.h"
 #include "target/arm/cpu.h"
 #include "hw/display/apple-m1-fb.h"
+#include "hw/intc/apple-aic.h"
 
 // The M1 has a fixed number of cores, model that
 #define APPLE_M1_FIRESTORM_CPUS 4
@@ -33,6 +34,7 @@ struct AppleM1State {
 
     /* SoC devices */
     AppleM1FBState fb;
+    AppleAICState aic;
 };
 
 #endif // HW_ARM_APPLE_M1_H

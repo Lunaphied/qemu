@@ -27,8 +27,8 @@
 #include "sysemu/sysemu.h"
 #include "exec/exec-all.h"
 #include "sysemu/reset.h"
-#include "hw/arm/apple-m1.h"
 #include "hw/misc/unimp.h"
+#include "hw/arm/apple-m1.h"
 
 // Notes on this file:
 // - This file doesn't actually represent the M1 very well, it's more a platform designed and focused around m1n1
@@ -50,6 +50,7 @@
 
 #define RAMLIMIT_GB     8192
 #define RAMLIMIT_BYTES  (RAMLIMIT_GB * GiB)
+
 enum {
     M1_MEM,   // A block of ram
     M1_UART,  // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
@@ -63,12 +64,12 @@ enum {
 // them up like this during dev (the UART is the correct address for where it is when m1n1 loads though)
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
-    [M1_ROM] =              {         0x0,     0x10000},
-    [M1_UART] =             { 0x235200000,     0x10000},
-    [M1_AIC] =              { 0x23B100000,     0x10000},
-    [M1_WDT] =              { 0x23D2B0000,       0x100},
-    [M1_FB] =               { 0x300000000,       8*GiB},
-    [M1_MEM] =              { 0x800000000,       8*GiB},
+    [M1_ROM] =              {         0x0,              0x10000},
+    [M1_UART] =             { 0x235200000,              0x10000},
+    [M1_AIC] =              { 0x23B100000,              0x10000},
+    [M1_WDT] =              { 0x23D2B0000,                0x100},
+    [M1_FB] =               { 0x300000000,                8*GiB},
+    [M1_MEM] =              { 0x800000000,       RAMLIMIT_BYTES},
 };
 
 // TODO: Get rid of this and just handle returning the size from the boot args
@@ -80,6 +81,8 @@ static hwaddr device_tree_end;
 static void apple_m1_init(Object *obj) {
     AppleM1State *s = APPLE_M1(obj);
 
+    /* TODO: Better object names */
+    
     // Initialize CPU cores
     for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
         object_initialize_child(obj, "firestorm[*]", &s->firestorm_cores[i],
@@ -93,6 +96,9 @@ static void apple_m1_init(Object *obj) {
     // Initialize framebuffer
     object_initialize_child(obj, "framebuffer", &s->fb,
 		    		TYPE_APPLE_M1_FB);
+    
+    // Initialize interrupt controller
+    object_initialize_child(obj, "apple-aic", &s->aic, TYPE_APPLE_AIC);
 }
 
 // Apple M1 reset needs us to put the correct x0 register to point to our boot args
@@ -191,18 +197,20 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     // hardware this isn't a concern.
     // XXX: pending AIC
     //sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
-    
-    // FIXME: Do them all and connect to AIC or whatever
-    // Connect a generic ARM timer to FIQ for the interrupts we need
+
+    /* Connect a generic ARM timer to FIQ for the interrupts we need */
     DeviceState *fiq_or = qdev_new(TYPE_OR_IRQ);
     object_property_add_child(OBJECT(s), "fiq-or", OBJECT(fiq_or));
+    
+    /* NOTE: if you use less than 16 it can't store state properly */
     qdev_prop_set_uint16(fiq_or, "num-lines", 16);
     qdev_realize_and_unref(fiq_or, NULL, &error_fatal);
+    
     // Connect the output to the FIQ input
     qdev_connect_gpio_out(fiq_or, 0, 
                           qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
                                            ARM_CPU_FIQ));
-    // Connect all of the timers as potential FIQ inputs (this might fix linux)
+    // Connect all of the timers as potential FIQ inputs fr good measure
     qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_PHYS,
                           qdev_get_gpio_in(fiq_or, 0));
     qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_VIRT,
@@ -212,12 +220,23 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_SEC,
                           qdev_get_gpio_in(fiq_or, 3));
     
+    sysbus_realize(SYS_BUS_DEVICE(&s->aic), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->aic), 0, memmap[M1_AIC].base);
+    
+    /* TODO: CPU order (at least for linux is 0-4 icestorm, 0-4 firestorm
+     *       we will want to connect all of them as CPUs 0-8
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->aic), 0,
+                       qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
+                                        ARM_CPU_IRQ));
+    /* Connect UART to AIC */
+    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
+                       qdev_get_gpio_in(DEVICE(&s->aic), 36));
+    /* TODO: Connect input IRQs from hardware to this */
+    //create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 
     // TODO: Implement
-    create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 
     create_unimplemented_device("Watchdog", memmap[M1_WDT].base, memmap[M1_WDT].size);
-    // exynos4210_uart_create(memmap[VIRT_UART].base, 16, 0, serial_hd(0),
-    //                       qdev_get_gpio_in(DEVICE(cpuobj), ARM_CPU_IRQ));
-
+    
     // FIXME: Do this properly
     // Add a reset hook for the first core that will pull in the correct x0 reg for boot_args
     qemu_register_reset(handle_m1_reset, &s->firestorm_cores[0]);
@@ -255,7 +274,7 @@ static struct arm_boot_info m1_boot_info;
 // TODO: Make this a lot nicer (model after the virt platform fdt builders)
 // it should be dynamic (ideally we would take an existing device tree from
 // hardware and then create the other devices using the information so contained
-static void create_apple_dt(void) {
+static void create_apple_dt(MachineState *machine) {
     struct node_header {
         uint32_t prop_count;
         uint32_t child_count;
@@ -337,7 +356,7 @@ static void create_apple_dt(void) {
 // This builds and then inserts a boot args structure like m1n1 and OS X expect
 // it then puts it into memory (I've moved it to 0x10 so that it's not set to
 // a null pointer)
-static void create_boot_args(void) {
+static void create_boot_args(MachineState *machine) {
     struct {
         uint16_t revision;
         uint16_t pad0;
@@ -362,7 +381,7 @@ static void create_boot_args(void) {
     bootargs.revision = 0xdead;
     bootargs.virtual_load_base = memmap[M1_MEM].base;
     bootargs.physical_load_base = memmap[M1_MEM].base;
-    bootargs.memory_size = memmap[M1_MEM].size;
+    bootargs.memory_size = machine->ram_size;
     bootargs.loaded_end = memmap[M1_MEM].base + 0x100000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
     bootargs.fb_addr = memmap[M1_FB].base;
     bootargs.fb_stride = BOOTARGS_FB_STRIDE;
@@ -409,9 +428,9 @@ static void m1_mac_init(MachineState *machine)
     memory_region_add_subregion(sysmem, memmap[M1_MEM].base, machine->ram);
 
     // Add apple flavored device tree
-    create_apple_dt();
+    create_apple_dt(machine);
     // Add boot args
-    create_boot_args();
+    create_boot_args(machine);
 
     // XXX: These are unused but we leave temporarily 
     m1_boot_info.loader_start = memmap[M1_MEM].base;

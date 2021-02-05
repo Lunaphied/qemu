@@ -25,6 +25,9 @@ config APIC
     select MSI_NONBROKEN
     select I8259
 
+config APPLE_AIC
+    bool
+
 config ARM_GIC_KVM
     bool
     default y
