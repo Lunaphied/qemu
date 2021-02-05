@@ -230,8 +230,16 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
                                         ARM_CPU_IRQ));
     /* Connect UART to AIC */
-    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
-                       qdev_get_gpio_in(DEVICE(&s->aic), 36));
+    /* FIXME: connect to every IRQ bc something weird with linux */
+    DeviceState *splitq = qdev_new("split-irq");
+    object_property_add_child(OBJECT(s), "split-irq", OBJECT(splitq));
+    qdev_prop_set_uint16(splitq, "num-lines", AIC_NUM_IRQ);
+    qdev_realize_and_unref(splitq, NULL, &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(splitq, 0));
+    for (int i = 0; i < AIC_NUM_IRQ; i++) {
+        qdev_connect_gpio_out(splitq, i, qdev_get_gpio_in(DEVICE(&s->aic), i));
+    }
+    
     /* TODO: Connect input IRQs from hardware to this */
     //create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 
     // TODO: Implement

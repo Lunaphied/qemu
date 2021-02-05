@@ -35,6 +35,20 @@
  * 0x200C            - IPI flag clear
  * 0x2024            - IPI mask set
  * 0x2028            - IPI mask clear
+ * 
+ * 0x5000            - per CPU view of 0x2004
+ * Right now for development I've placed the "views" into other CPU's versions
+ * of these registers at 0x5000, so far I'm just putting the reason
+ * registers there. The normal reason will be handled by aliases that
+ * redirect that region to the per-cpu region. This is going to need to
+ * be more complete in the future and use the real offsets but for now
+ * this will be enough.
+ * TODO: above is not actually done, right now we just use a hack
+ * since for single core the interrupt executer will always be called
+ * as the same CPU. We *cannot* get the CPU from qemu (at least in my
+ * opinion) as that will create a situation where we assume the current
+ * CPU is always an ARM cpu or compattible, which isn't ideal for a peripherial
+ * instead it will just error if a CPU hasn't been hooked up properly.
  */
 
 #include "qemu/osdep.h"
@@ -72,6 +86,10 @@
 #define AIC_MASK_CLEAR      0x4180
 #define AIC_MASK_CLEAR_END  (AIC_MASK_CLEAR+AIC_IRQ_REG_SIZE-1)
 
+/* HW IRQ state */
+#define AIC_HW_STATE        0x4200
+#define AIC_HW_STATE_END    (AIC_HW_STATE+AIC_IRQ_REG_SIZE-1)
+
 /* TODO: Understand IPIs better, the linux driver implies features
  * that aren't exposed in the actual driver or the Github wiki page
  * entry, but doesn't use them either so there's no clarity of how
@@ -91,37 +109,157 @@
 /* IRQ reasons (reported by reason register) */
 #define AIC_IRQ_HW  (1<<0)
 #define AIC_IRQ_IPI (1<<2)
+/* TODO: Masks and shifts for IRQ reason */
 
 /* HACK: bad bad bad */
+/* Explanation: The AIC as a peripheral has a concept of the
+ * current core for accesses there's a "WHOAMI" register that
+ * likely reports the value stored in MPIDR, there's a current
+ * CPU view of the state (or at least IPIs), then at an offset
+ * you can access each specific CPU's view of the registers
+ * (at least for IPIs), this is how you send a "self" IPI vs.
+ * an "other" IPI. The reason tells you the difference when
+ * you get called, but you can trigger a "self" IPI by writing
+ * to the self IPI bit using a view into another core's registers
+ *
+ * The problem is that we don't get passed in a CPU reference
+ * when someone accesses the memory. And if access to the
+ * peripheral depends on the CPU calling, it's not really on
+ * a system bus so much as it is an internal core peripehral
+ * with an outside bus interface too. This seems fairly tricky
+ * to implement in QEMU, the GICv3 seems to handle this by
+ * having a split state, with the GIC initializing per-cpu
+ * states that reference their CPU and then registering things
+ * like MMIO with a reference to the PER CPU state so we know
+ * who's accessing us. Lets do similar but not as hacky, this
+ * means letting the board/SoC code provide us with CPU
+ * references to use (and their corresponding numbers)
+ * TODO: understand if the above solution is good enough
+ * TODO: find out how linux maps IPI/dist masks to CPU numbers
+ *       might just be based on the info from the device tree
+ */
 static uint32_t current_reason;
 
+#define AIC_INVALID_IRQ (-1)
+
+/* TODO: prefix these with is_* */
+/*
+ * Reports if the current HW IRQ line number is a valid number
+ * Takes a state argument to support eventual use of a property
+ * for the IRQ number argument
+ */
+static inline bool aic_irq_valid(AppleAICState *s, int n)
+{
+    /* IRQs go from 0..num_irq-1 */
+    if ((n < 0) || (n >= s->num_irq)) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Returns if a given HW IRQ is currently pending
+ */
+static inline bool aic_is_irq_pending(AppleAICState *s, int n)
+{
+    if (!aic_irq_valid(s, n)) {
+        return false;
+    }
+    /* FIXME: Macros */
+    return !!(s->irq_pending[n/32] & (n & 0x1F));
+}
+
 /* Handle updating and initiating IRQs after applying masks */
-static void aic_update_irq(AppleAICState *s, int n)
+static void aic_update_irq(AppleAICState *s)
 {
     /* TODO: This way of handling things is common but does
      * other code pass in the IRQ in question?
      */
     
-    /* TODO: Figure out priority between IPIs and HW IRQs */
-    
+    /* We currently have to check ALL HW irqs that might be pending
+     * since all the HW IRQs for a given CPU are OR'd together according
+     * to the distributor. There's probably a cleaner interface to do
+     * this with more performance than checking every single IRQ but
+     * for now that's what we do.
+     * 
+     * TODO: check the above and use bit manipulation macros
+     */
+    /* FIXME: stop relying on the compiler to make this fast? */
+    /* FIXME: a better way of doing this? depends on num-cpus <= 32 */
+    /* Pending mask of all OR'd potential IRQs, we use this to set the
+     * IRQs at the end so that we know that no IRQs are raised when
+     * setting. A different way of handling incoming IRQs would probably
+     * be able to make this not so clunky
+     */
+    /* FIXME: this is all wrong, reason also contains the IRQ that we are
+     * handling, so this whole mess is wrong (it's also SUPER slow) */
+    uint32_t hw_irqs = 0;
+    /* HACK: Highest priority HW IRQ */
+    int hw_irq[AIC_MAX_CPUS];
+    for (int i = 0; i < AIC_MAX_CPUS; i++) {
+        hw_irq[i] = INT_MAX;
+    }
+    for (int i = 0; i < s->num_irq/32; i++) {
+        //printf("irq reg: %d\n", i);
+        /* Compute the masked value */
+        uint32_t valid_hw = s->irq_pending[i] & ~(s->irq_mask[i]);
+        /* We only have potential to set the IRQ lines high if the IRQs
+         * are still raised, since this controller is level triggered
+         */
+        if (valid_hw) {
+            /* Distribute the IRQs */
+            for (int j = 0; j < 32; j++) {
+                //printf("testing IRQs %d-%d\n", i*32, i*32+31);
+                //printf("values set are: %0x\n", valid_hw);
+                int irq_num = (i*32)+j;
+                //printf("irq_num = %d\n", irq_num);
+                if (valid_hw & (1<<j)) {
+                    uint32_t valid_cpus = s->irq_dist[irq_num];
+                    /* Set the lines for potential CPU irqs for unmasked, raised IRQs */
+                    hw_irqs |= valid_cpus;
+                    for (int k = 0; k < s->num_cpu; k++) {
+                        if (valid_cpus & (1<<k)) {
+                            /* Lower numbered interrupts have higher priority */
+                            if (irq_num < hw_irq[k]) {
+                                hw_irq[k] = irq_num;
+                            }
+                        }
+                    }
+                    //printf("Distributing IRQ#%d to CPUs@%0x\n", irq_num, valid_cpus);
+                }
+            }
+        }
+    }
+    /* HACK: Mask only the HW IRQs being handled */
+    for (int i = 0; i < s->num_cpu; i++) {
+        if (hw_irqs & (1<<i)) {
+            /* Mask the IRQ */
+            s->irq_mask[hw_irq[i]/23] |= 1<< (hw_irq[i] & 0x1F);
+        }
+    }
     uint32_t valid_ipis = s->ipi_pending & ~(s->ipi_mask);
     if (valid_ipis) {
-        printf("valid IPIs were: %0x\n", valid_ipis);
+        //printf("valid IPIs were: %0x\n", valid_ipis);
     }
-    // TODO: Set reason here and hope that's the one when
-    // we raise the IRQ?
-    // TODO: Handle for each bit better
-    /* IPI handling, both setting and unsetting */
-    for (int i = 0; i < 8; i++) {
-        if (valid_ipis & (1<<i)) {
+    
+    /* TODO: Figure out priority between IPIs and HW IRQs */
+    
+    /* Update the IRQ lines */
+    for (int i = 0; i < s->num_cpu; i++) {
+        if (hw_irqs & (1<<i)) {
+            //printf("Raising IRQ for CPU@%d\n", i);
+            /* HACK */
+            current_reason = (AIC_IRQ_HW<<16)|hw_irq[i];
+            qemu_irq_raise(s->irq_out[i]);
+        } else if (valid_ipis & (1<<i)) {
             /* Mask it first */
             s->ipi_mask |= 1<<i;
             /* HACK */
-            current_reason = AIC_IRQ_IPI;
-            printf("Raising IRQ %d\n", i);
+            current_reason = (AIC_IRQ_IPI<<16);
+            //printf("Raising IPI for CPU@%0x\n",i);
             qemu_irq_raise(s->irq_out[i]);
         } else {
-            /* Level triggered, should lower if unset */
+            /* Nothing is raising the IRQ line */
             qemu_irq_lower(s->irq_out[i]);
         }
     }
@@ -147,6 +285,8 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
          */
         uint32_t old_reason = current_reason;
         current_reason = 0;
+        /* TODO: Should we do an AIC update IRQ here since IRQ
+         * was acked?*/
         return old_reason;
     }
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
@@ -159,15 +299,22 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* TODO: Same as AIC_SW_SET */
         return 0;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        return s->irq_mask[(offset - AIC_MASK_SET)/32];
+        return s->irq_mask[(offset - AIC_MASK_SET)/4];
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        return s->irq_mask[(offset - AIC_MASK_CLEAR)/32];
+        return s->irq_mask[(offset - AIC_MASK_CLEAR)/4];
     case AIC_IPI_FLAG_SET:
     case AIC_IPI_FLAG_CLEAR:
         return s->ipi_pending;
     case AIC_IPI_MASK_SET: 
     case AIC_IPI_MASK_CLEAR:
         return s->ipi_mask;
+    case AIC_HW_STATE ... AIC_HW_STATE_END: /* State of input HW lines */
+        /* Get the current pending value which is what I think this
+         * does on hardware
+         */
+        /* FIXME: bounds checking */
+        printf("accessing irq_pending[%ld] = %d\n", (offset-AIC_HW_STATE)/4, s->irq_pending[(offset - AIC_HW_STATE)/4]);
+        return s->irq_pending[(offset - AIC_HW_STATE)/4];
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
@@ -186,44 +333,44 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
         /* TODO: This would have to raise the IRQ line */
         // TODO: proper irq input
-        aic_update_irq(s, 0);
+        aic_update_irq(s);
         break;
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
         /* TODO: And this would have to lower it if HW isn't
          * driving it (so we need an OR effectively)
          */
         // TODO: proper irq input
-        aic_update_irq(s, 0);
+        aic_update_irq(s);
         break;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        s->irq_mask[(offset - AIC_MASK_SET)/32] |= val & 0xFFFFFFFF;
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        s->irq_mask[(offset - AIC_MASK_SET)/4] |= val & 0xFFFFFFFF;
+        // TODO: only handle changes
+        aic_update_irq(s);
         break;
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        s->irq_mask[(offset - AIC_MASK_CLEAR)/32] &= ~(val & 0xFFFFFFFF);
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        s->irq_mask[(offset - AIC_MASK_CLEAR)/4] &= ~(val & 0xFFFFFFFF);
+        // TODO: only handle changes
+        aic_update_irq(s);
         break;
     case AIC_IPI_FLAG_SET:
         s->ipi_pending |= (val & 0xFFFFFFFF);
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        // TODO: only handle changes/IPIs
+        aic_update_irq(s);
         break;
     case AIC_IPI_FLAG_CLEAR:
         s->ipi_pending &= ~(val & 0xFFFFFFFF);
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        // TODO: only handle changes/IPIs
+        aic_update_irq(s);
         break;
     case AIC_IPI_MASK_SET: 
         s->ipi_mask |= (val & 0xFFFFFFFF);
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        // TODO: only handle changes/IPIs
+        aic_update_irq(s);
         break;
     case AIC_IPI_MASK_CLEAR:
         s->ipi_mask &= ~(val & 0xFFFFFFFF);
-        // TODO: proper irq input
-        aic_update_irq(s, 0);
+        // TODO: only handle changes/IPIs
+        aic_update_irq(s);
         break;
     default:
         printf("aic_mem_write: Unhandled write of %0lx to @%0lx of size=%d\n",
@@ -248,21 +395,32 @@ static void aic_irq_handler(void *opaque, int n, int level)
     AppleAICState *s = APPLE_AIC(opaque);
     /* TODO: handle aborting if n>AIC_NUM_IRQ */
     /* Update pending */
-    if (n < AIC_NUM_IRQ) {
+    if (aic_irq_valid(s, n)) {
         /* The logic below is too confusing, wrap in macros or
          * an inline function (inline functions seem cleaner */
-        s->irq_pending[n/32] |= n & 0x1F;
+        if (level) {
+            s->irq_pending[n/32] |= 1<<(n & 0x1F);
+            //printf("irq_pending[%d] |= %d\n", n/32, n & 0x1F);
+        } else {
+            s->irq_pending[n/32] &= ~(1<<(n & 0x1F));
+            //printf("irq_pending[%d] &= ~(%0x)\n", n/32, 1<<(n & 0x1F));
+        }
     }
-    aic_update_irq(s, n);
+    aic_update_irq(s);
 }
 
 static void apple_aic_realize(DeviceState *dev, Error **errp)
 {
     AppleAICState *s = APPLE_AIC(dev);
     
+    /* Initialize properties */
+    /* TODO: make these top level properties instead */
+    s->num_irq = AIC_NUM_IRQ;
+    s->num_cpu = AIC_MAX_CPUS;
+    
     /* Clear state */
     /* TODO: /32 is really not ideal, use some sort of BITS wrapper */
-    for (int i = 0; i < (AIC_NUM_IRQ/32); i++) {
+    for (int i = 0; i < (s->num_irq/32); i++) {
         /* IRQs are cleared by default */
         s->irq_pending[i] = 0;
         /* Masks are set by default */
@@ -270,15 +428,14 @@ static void apple_aic_realize(DeviceState *dev, Error **errp)
     }
     
     memory_region_init_io(&s->mmio_region, OBJECT(s), &aic_io_ops, s,
-                          "aic-mmio", 0x10000);
+                          "aic-mmio", AIC_MMIO_SIZE);
     /* Init input HW interrupts */
-    qdev_init_gpio_in(dev, aic_irq_handler, AIC_NUM_IRQ);
+    qdev_init_gpio_in(dev, aic_irq_handler, s->num_irq);
     
     SysBusDevice *busdev = SYS_BUS_DEVICE(s);
     sysbus_init_mmio(busdev, &s->mmio_region);
     
-    /* TODO: Make this based on num cpus */
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < s->num_cpu; i++) {
         sysbus_init_irq(busdev, &s->irq_out[i]);
     }
 }
