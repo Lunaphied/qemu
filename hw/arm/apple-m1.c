@@ -183,7 +183,7 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     DeviceState *uart = qdev_new("exynos4210.uart");
     object_property_add_child(OBJECT(s), "uart", OBJECT(uart));
     qdev_prop_set_chr(uart, "chardev", serial_hd(0));
-    qdev_prop_set_uint32(uart, "rx-size", 0x10000); // Give the serial port an insane buffer to speed up code loads
+    //qdev_prop_set_uint32(uart, "rx-size", 0x10000); // Give the serial port an insane buffer to speed up code loads
     sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
     // XXX: Currently the FIFO reset state is changed so that it's ready for FIFO usage before m1n1 starts
     // the correct solution is probably to have m1n1 specifically enable the FIFO or add a pre-m1n1 boot stub
@@ -231,6 +231,7 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
                                         ARM_CPU_IRQ));
     /* Connect UART to AIC */
     /* FIXME: connect to every IRQ bc something weird with linux */
+    /*
     DeviceState *splitq = qdev_new("split-irq");
     object_property_add_child(OBJECT(s), "split-irq", OBJECT(splitq));
     qdev_prop_set_uint16(splitq, "num-lines", AIC_NUM_IRQ);
@@ -238,7 +239,8 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(splitq, 0));
     for (int i = 0; i < AIC_NUM_IRQ; i++) {
         qdev_connect_gpio_out(splitq, i, qdev_get_gpio_in(DEVICE(&s->aic), i));
-    }
+    } */
+    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->aic), 605));
     
     /* TODO: Connect input IRQs from hardware to this */
     //create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 

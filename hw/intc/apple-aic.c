@@ -172,6 +172,7 @@ static inline bool aic_is_irq_pending(AppleAICState *s, int n)
 /* Handle updating and initiating IRQs after applying masks */
 static void aic_update_irq(AppleAICState *s)
 {
+#if 0
     /* TODO: This way of handling things is common but does
      * other code pass in the IRQ in question?
      */
@@ -247,7 +248,7 @@ static void aic_update_irq(AppleAICState *s)
     /* Update the IRQ lines */
     for (int i = 0; i < s->num_cpu; i++) {
         if (hw_irqs & (1<<i)) {
-            //printf("Raising IRQ for CPU@%d\n", i);
+            printf("Raising IRQ for CPU@%d\n", i);
             /* HACK */
             current_reason = (AIC_IRQ_HW<<16)|hw_irq[i];
             qemu_irq_raise(s->irq_out[i]);
@@ -262,6 +263,23 @@ static void aic_update_irq(AppleAICState *s)
             /* Nothing is raising the IRQ line */
             qemu_irq_lower(s->irq_out[i]);
         }
+    }
+#endif
+    /* BIG BIG HACK */
+    uint32_t is_pending = s->irq_pending[18] & (1<<29);
+    uint32_t mask = s->irq_mask[18] & (1<<29);
+    uint32_t masked = is_pending & ~(mask);
+    static int raise_refcount = 0;
+    if (masked && (raise_refcount == 0)) {
+        raise_refcount++;
+        //printf("Raising IRQ %d\n", 605);
+        s->irq_mask[18] |= (1<<29);
+        current_reason = (AIC_IRQ_HW<<16)|(605);
+        qemu_irq_raise(s->irq_out[0]);
+    } else if (!masked && (raise_refcount > 0)) {
+        raise_refcount = 0;
+        //printf("Lowering IRQ %d\n", 605);
+        qemu_irq_lower(s->irq_out[0]);
     }
 }
 
@@ -344,11 +362,13 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
         s->irq_mask[(offset - AIC_MASK_SET)/4] |= val & 0xFFFFFFFF;
+        //printf("Setting mask IRQS %ld-%ld\n", (offset - AIC_MASK_SET)/4*32,(offset - AIC_MASK_SET)/4*32+31);
         // TODO: only handle changes
         aic_update_irq(s);
         break;
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
         s->irq_mask[(offset - AIC_MASK_CLEAR)/4] &= ~(val & 0xFFFFFFFF);
+        //printf("Clearing mask IRQS %ld-%ld\n", (offset - AIC_MASK_CLEAR)/4*32,(offset - AIC_MASK_CLEAR)/4*32+31);
         // TODO: only handle changes
         aic_update_irq(s);
         break;

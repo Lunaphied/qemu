@@ -75,7 +75,7 @@ typedef struct Exynos4210UartReg {
 
 static const Exynos4210UartReg exynos4210_uart_regs[] = {
     {"ULCON",    ULCON,    0x00000000},
-    {"UCON",     UCON,     0x00000000},
+    {"UCON",     UCON,     0x00003000},
     {"UFCON",    UFCON,    0x00000001}, /* XXX: M1 reset with FIFO */
     {"UMCON",    UMCON,    0x00000000},
     {"UTRSTAT",  UTRSTAT,  0x00000006}, /* RO */
@@ -92,15 +92,6 @@ static const Exynos4210UartReg exynos4210_uart_regs[] = {
 };
 
 #define EXYNOS4210_UART_REGS_MEM_SIZE    0x3C
-
-/* Apple */
-#define UCON_RXTO_ENABLE_SHIFT        9
-#define UCON_RXTO_ENABLE              (1<<UCON_RXTO_ENABLE_SHIFT)
-#define UCON_RXTHRESH_ENABLE_SHIFT    12
-#define UCON_RXTHRESH_ENABLE          (1<<UCON_RXTHRESH_ENABLE_SHIFT)
-#define UCON_TXTHRESH_ENABLE_SHIFT    13
-#define UCON_TXTHRESH_ENABLE          (1<<UCON_TXTHRESH_ENABLE_SHIFT)
-/* end Apple */
 
 /* UART FIFO Control */
 #define UFCON_FIFO_ENABLE                    0x1
@@ -132,11 +123,7 @@ static const Exynos4210UartReg exynos4210_uart_regs[] = {
 #define ULCON_STOP_BIT_SHIFT  1
 
 /* UART Tx/Rx Status */
-/* Apple changes */
-#define UTRSTAT_Rx_TIMEOUT              (1<<9)
-#define UTRSTAT_Rx_TRIGGERED            (1<<4)
-#define UTRSTAT_Tx_TRIGGERED            (1<<5)
-/* End apple changes */
+#define UTRSTAT_Rx_TIMEOUT              0x8
 #define UTRSTAT_TRANSMITTER_EMPTY       0x4
 #define UTRSTAT_Tx_BUFFER_EMPTY         0x2
 #define UTRSTAT_Rx_BUFFER_DATA_READY    0x1
@@ -254,7 +241,6 @@ static void exynos4210_uart_update_dmabusy(Exynos4210UartState *s)
     }
 }
 
-static int stupid = -1;
 static void exynos4210_uart_update_irq(Exynos4210UartState *s)
 {
     /*
@@ -264,58 +250,40 @@ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
     if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
         uint32_t count = (s->reg[I_(UFSTAT)] & UFSTAT_Tx_FIFO_COUNT) >>
                 UFSTAT_Tx_FIFO_COUNT_SHIFT;
-        if (exynos4210_uart_Tx_FIFO_trigger_level(s) > 0 && (count > 0)) {
-            //printf("exynos TX trigger level: %d count=%d\n", exynos4210_uart_Tx_FIFO_trigger_level(s), count);
-        }
-        if ((count <= exynos4210_uart_Tx_FIFO_trigger_level(s)) &&
-            (s->reg[I_(UCON)] & UCON_TXTHRESH_ENABLE)) {
+
+        if (count <= exynos4210_uart_Tx_FIFO_trigger_level(s)) {
             s->reg[I_(UINTSP)] |= UINTSP_TXD;
-            s->reg[I_(UTRSTAT)] |= UTRSTAT_Tx_TRIGGERED;
-        } else {
-            s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Tx_TRIGGERED;
         }
-    
+
         /*
          * Rx interrupt if trigger level is reached or if rx timeout
          * interrupt is disabled and there is data in the receive buffer
          */
         count = fifo8_num_used(&s->rx);
-        if (exynos4210_uart_Rx_FIFO_trigger_level(s) > 0 && (count > 0)) {
-            //printf("exynos RX trigger level: %d count=%d\n", exynos4210_uart_Rx_FIFO_trigger_level(s), count);
-        }
-        if ((count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) &&
-            (s->reg[I_(UCON)] & UCON_RXTHRESH_ENABLE)) {
+        if ((count && !(s->reg[I_(UCON)] & 0x80)) ||
+            count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) {
             exynos4210_uart_update_dmabusy(s);
             s->reg[I_(UINTSP)] |= UINTSP_RXD;
-            if ((count >= exynos4210_uart_Rx_FIFO_trigger_level(s)) &&
-                (s->reg[I_(UCON)] & UCON_RXTHRESH_ENABLE)) {
-                s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_TRIGGERED;
-            }
             timer_del(s->fifo_timeout_timer);
-        } else {
-            s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_TRIGGERED;
         }
     } else if (s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY) {
         exynos4210_uart_update_dmabusy(s);
         s->reg[I_(UINTSP)] |= UINTSP_RXD;
     }
 
-    s->reg[I_(UINTP)] = s->reg[I_(UTRSTAT)] & (UTRSTAT_Rx_TIMEOUT|UTRSTAT_Tx_TRIGGERED|UTRSTAT_Rx_TRIGGERED); //s->reg[I_(UINTSP)] & ~s->reg[I_(UINTM)];
-    //printf("UTRSTAT_Rx_TIMEOUT: %d\n", s->reg[I_(UTRSTAT)] & (UTRSTAT_Rx_TIMEOUT));
-    //printf("UTRSTAT_Tx_TRIGGERED: %d\n", s->reg[I_(UTRSTAT)] & (UTRSTAT_Tx_TRIGGERED));
-    //printf("UTRSTAT_Rx_TRIGGERED: %d\n", s->reg[I_(UTRSTAT)] & (UTRSTAT_Rx_TRIGGERED));
-    
+    s->reg[I_(UINTP)] = s->reg[I_(UINTSP)] & ~s->reg[I_(UINTM)];
+    static int was_raised = -1;
     if (s->reg[I_(UINTP)]) {
-        if (stupid != 1) {
+        qemu_irq_raise(s->irq);
+        if (was_raised != 1) {
             trace_exynos_uart_irq_raised(s->channel, s->reg[I_(UINTP)]);
-            stupid = 1;
-            qemu_irq_raise(s->irq);
+            was_raised = 1;
         }
     } else {
-        if (stupid != 0) {
+        qemu_irq_lower(s->irq);
+        if (was_raised != 0) {
             trace_exynos_uart_irq_lowered(s->channel);
-            stupid = 0;
-            qemu_irq_lower(s->irq);
+            was_raised = 0;
         }
     }
 }
@@ -328,7 +296,7 @@ static void exynos4210_uart_timeout_int(void *opaque)
                                  s->reg[I_(UINTSP)]);
 
     if ((s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY) ||
-        (s->reg[I_(UCON)] & UCON_RXTO_ENABLE)) {
+        (s->reg[I_(UCON)] & (1 << 11))) {
         s->reg[I_(UINTSP)] |= UINTSP_RXD;
         s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_TIMEOUT;
         exynos4210_uart_update_dmabusy(s);
@@ -433,7 +401,7 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
             trace_exynos_uart_tx(s->channel, ch);
             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
-                    UTRSTAT_Tx_BUFFER_EMPTY | UTRSTAT_Tx_TRIGGERED;
+                    UTRSTAT_Tx_BUFFER_EMPTY;
             s->reg[I_(UINTSP)]  |= UINTSP_TXD;
             exynos4210_uart_update_irq(s);
         }
@@ -458,17 +426,12 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
         break;
     case UINTSP:
         s->reg[I_(UINTSP)]  &= ~val;
-        exynos4210_uart_update_irq(s);
         break;
     case UINTM:
         s->reg[I_(UINTM)] = val;
         exynos4210_uart_update_irq(s);
         break;
     case UCON:
-        s->reg[I_(UCON)] = val;
-        trace_exynos_uart_intclr(s->channel, s->reg[I_(UCON)]);
-        exynos4210_uart_update_irq(s);
-        break;
     case UMCON:
     default:
         s->reg[I_(offset)] = val;
@@ -570,7 +533,7 @@ static void exynos4210_uart_receive(void *opaque, const uint8_t *buf, int size)
             size = fifo8_num_free(&s->rx);
             s->reg[I_(UINTSP)] |= UINTSP_ERROR;
         }
-        fifo8_push_all(&s->rx, buf, size);
+	fifo8_push_all(&s->rx, buf, size);
         exynos4210_uart_rx_timeout_set(s);
     } else {
         s->reg[I_(URXH)] = buf[0];
@@ -683,7 +646,7 @@ static void exynos4210_uart_realize(DeviceState *dev, Error **errp)
 
     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          exynos4210_uart_timeout_int, s);
-    printf("Creating exynos4210 uart with rx buffer: %d\n", s->rx_size);
+
     fifo8_create(&s->rx, s->rx_size);
     fifo8_create(&s->tx, s->tx_size);
 
