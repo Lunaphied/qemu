@@ -57,14 +57,14 @@
 
 /* TODO: Add tracing */
 
-/* TODO: Register defines */
+/* TODO: Move register defs to seperate header */
 #define AIC_INFO         0x0004
 #define AIC_CURRENT_CORE 0x2000
 #define AIC_IRQ_REASON   0x2004
 
 /* HW to CPU distribution map */
 #define AIC_DIST         0x3000
-#define AIC_DIST_SIZE    0x1000
+#define AIC_DIST_SIZE    (AIC_NUM_IRQ*4)
 #define AIC_DIST_END     (AIC_DIST+AIC_DIST_SIZE-1)
 
 /* All the HW IRQ ranges are this big */
@@ -138,9 +138,12 @@
  * TODO: find out how linux maps IPI/dist masks to CPU numbers
  *       might just be based on the info from the device tree
  */
-static uint32_t current_reason;
+static uint32_t current_reason = 0;
 
+/* Helpers to avoid mystery constants */
 #define AIC_INVALID_IRQ (-1)
+#define AIC_IRQ_HIGH    1
+#define AIC_IRQ_LOW     0
 
 /* TODO: prefix these with is_* */
 /*
@@ -157,117 +160,178 @@ static inline bool aic_irq_valid(AppleAICState *s, int n)
     return true;
 }
 
+/* 
+ * Handles raising/lowering an IRQ output only if the value changed
+ * this might make tracing annoying though
+ */
+static inline void aic_set_irq(AppleAICState *s, int cpu, int level)
+{
+    if (cpu > AIC_MAX_CPUS) {
+        return;
+    }
+    uint32_t masked = s->irq_out_status & AIC_BIT_MASK(cpu);
+    if (level && !masked) {
+        /* IRQ just was raised so trigger an output IRQ change */
+        s->irq_out_status |= AIC_BIT_MASK(cpu);
+        //printf("Raising IRQ for CPU@%d\n", cpu);
+        qemu_irq_raise(s->irq_out[cpu]);
+    } else if (!level && masked) {
+        /* IRQ just was lowered so trigger an output IRQ change */
+        s->irq_out_status &= ~AIC_BIT_MASK(cpu);
+        qemu_irq_lower(s->irq_out[cpu]);
+    }
+}
+/* 
+ * Forward declare, later we should probably just swap
+ * the order TODO
+ */
+static void aic_update_irq(AppleAICState *s);
+
+/* Handle updating and apply a single 32-bit register of IRQ */
+static void aic_update_irq_reg(AppleAICState *s, int reg)
+{
+    /* Must be valid, TODO maybe should assert? */
+    if (reg > AIC_IRQ_REG_COUNT) {
+        return;
+    }
+    /*
+     * Right now without a conception of what else might be
+     * driving the IRQ line, we cannot do much meaningful
+     * processing simply handling it in a per-reg update.
+     * 
+     * Theoretically we could set IRQ lines and only do
+     * updates for cleared ones, but that means this only
+     * does anything meaningful for fully set IRQ state
+     * registers, which is highly unlikely to say the least.
+     * 
+     * Having an idea of if other interrupts are driving
+     * the IRQ line for this CPU would change that but that
+     * could get messy, we would keep a counter for each output
+     * IRQ line (one per CPU then) and increment it when
+     * an IRQ is raised on that line, and decrement it when
+     * an IRQ stops asserting. However that gets complex fast
+     * since we have to make sure to update it after masking
+     * and overall there's a potential for error. Instead lets
+     * just hope iterating is fast enough
+     */
+    aic_update_irq(s);
+}
+
 /* Handle updating and initiating IRQs after applying masks */
 static void aic_update_irq(AppleAICState *s)
 {
-#if 0
-    /* TODO: This way of handling things is common but does
-     * other code pass in the IRQ in question?
+    /* 
+     * NOTE: This code is like this because it's a slightly more
+     * optimal approach visually than literally testing every bit
+     * through the accessor functions. However it might actually
+     * be less optimal because it might confuse the compiler more
      */
+    /* 
+     * Holds the value of the lines for each output IRQ line after
+     * processing all the potential pending IRQs, if it's different
+     * than the last state of that line, we raise or lower that line
+     */
+    uint32_t result_lines = 0;
+    /* HACK need to store as part of per-cpu data */
+    uint32_t result_irqs[AIC_MAX_CPUS] = { 0, };
     
-    /* We currently have to check ALL HW irqs that might be pending
-     * since all the HW IRQs for a given CPU are OR'd together according
-     * to the distributor. There's probably a cleaner interface to do
-     * this with more performance than checking every single IRQ but
-     * for now that's what we do.
-     * 
-     * TODO: check the above and use bit manipulation macros
-     */
-    /* FIXME: stop relying on the compiler to make this fast? */
-    /* FIXME: a better way of doing this? depends on num-cpus <= 32 */
-    /* Pending mask of all OR'd potential IRQs, we use this to set the
-     * IRQs at the end so that we know that no IRQs are raised when
-     * setting. A different way of handling incoming IRQs would probably
-     * be able to make this not so clunky
-     */
-    /* FIXME: this is all wrong, reason also contains the IRQ that we are
-     * handling, so this whole mess is wrong (it's also SUPER slow) */
-    uint32_t hw_irqs = 0;
-    /* HACK: Highest priority HW IRQ */
-    int hw_irq[AIC_MAX_CPUS];
-    for (int i = 0; i < AIC_MAX_CPUS; i++) {
-        hw_irq[i] = INT_MAX;
-    }
-    for (int i = 0; i < s->num_irq/32; i++) {
-        //printf("irq reg: %d\n", i);
-        /* Compute the masked value */
-        uint32_t valid_hw = s->irq_pending[i] & ~(s->irq_mask[i]);
-        /* We only have potential to set the IRQ lines high if the IRQs
-         * are still raised, since this controller is level triggered
-         */
-        if (valid_hw) {
-            /* Distribute the IRQs */
-            for (int j = 0; j < 32; j++) {
-                //printf("testing IRQs %d-%d\n", i*32, i*32+31);
-                //printf("values set are: %0x\n", valid_hw);
-                int irq_num = (i*32)+j;
-                //printf("irq_num = %d\n", irq_num);
-                if (valid_hw & (1<<j)) {
-                    uint32_t valid_cpus = s->irq_dist[irq_num];
-                    /* Set the lines for potential CPU irqs for unmasked, raised IRQs */
-                    hw_irqs |= valid_cpus;
-                    for (int k = 0; k < s->num_cpu; k++) {
-                        if (valid_cpus & (1<<k)) {
-                            /* Lower numbered interrupts have higher priority */
-                            if (irq_num < hw_irq[k]) {
-                                hw_irq[k] = irq_num;
-                            }
+    /* Update the IRQ lines */
+    for (int i = 0; i < AIC_IRQ_REG_COUNT; i++) {
+        /* Both HW and SW triggered HW are OR'd into one */
+        uint32_t pending = s->irq_pending[i] | s->sw_pending[i];
+        /* Apply the mask */
+        pending &= ~s->irq_mask[i];
+        if (pending) {
+            //printf("Found unmasked pending: %0x\n", pending);
+            /* Base number for IRQs stored in this register */
+            int irq_base = i * 32;
+            /* Starting from the first bit set, process all pending
+             * IRQs and check their masks, no processing is done if
+             * zero so ctz32 reports the number of trailing
+             * zeros so first set bit is 1<<ctz32(x)
+             */
+            int first_set = ctz32(pending);
+            /*
+             * Yes this tests first_set a second time but it's much
+             * cleaner than duplicating the code.
+             */
+            for (int j = first_set; j < 32; j++) {
+                /* Only process actually set IRQs */
+                if (!(pending & (1<<j))) {
+                    continue;
+                }
+                uint32_t dist = s->irq_dist[irq_base+j];
+                //printf("Distribution for IRQ %0x is %0x\n", irq_base+j, dist);
+                /* 
+                 * Only process the lines if some of them might be unset 
+                 * (this clears all the values already set in result_lines)
+                 * Already set lines alerady have a higher priority (lower #)
+                 * IRQ waiting to be raised until after all lines are processed
+                 * TODO: should we just raise immediately?
+                 */
+                dist &= ~result_lines;
+                /*
+                 * Now that we have masked the previously set lines
+                 * we can just OR in the new ones and process the
+                 * new lines to set the active IRQ numbers
+                 */
+                result_lines |= dist;
+                /* Try to distribute the first set interrupt */
+                if (dist) {
+                    for (int k = ctz32(dist); k < 32; k++) {
+                        /* 
+                         * We only accelerate which bit we start
+                         * with, have to check the rest of the bits
+                         * too
+                         */
+                        if (!(dist & (1<<k))) {
+                            continue;
                         }
+                        /* Store the IRQ number that is responsible
+                         * for raising the line
+                         */
+                        result_irqs[k] = irq_base+j;
                     }
-                    //printf("Distributing IRQ#%d to CPUs@%0x\n", irq_num, valid_cpus);
                 }
             }
         }
+        /* 
+         * TODO: If all the lines are set then we don't need to iterate
+         * anymore (but this is only useful if we can ignore the lines
+         * not being used by CPUs)
+         */
     }
-    /* HACK: Mask only the HW IRQs being handled */
-    for (int i = 0; i < s->num_cpu; i++) {
-        if (hw_irqs & (1<<i)) {
-            /* Mask the IRQ */
-            s->irq_mask[hw_irq[i]/23] |= 1<< (hw_irq[i] & 0x1F);
-        }
-    }
-    uint32_t valid_ipis = s->ipi_pending & ~(s->ipi_mask);
-    if (valid_ipis) {
-        //printf("valid IPIs were: %0x\n", valid_ipis);
+    if (result_lines != 0) {
+        //printf("AIC: Computed IRQs after search: %0x\n", result_lines);
     }
     
-    /* TODO: Figure out priority between IPIs and HW IRQs */
+    /* 
+     * Now compute IPIs which are simply the IPI pending after masking
+     * TODO: This actually only computes IPIs using the "other" mode
+     * where we use the aliased IPI register to poke a bit that indicates
+     * to set the IPI on the specific processor, kinda strange to
+     * distinguish self vs. other, I wonder how OS X is coded
+     */
+    uint32_t valid_ipis = s->ipi_pending & ~s->ipi_mask;
     
-    /* Update the IRQ lines */
+    /* This can't really be faster since we need to apply every bit */
     for (int i = 0; i < s->num_cpu; i++) {
-        if (hw_irqs & (1<<i)) {
-            printf("Raising IRQ for CPU@%d\n", i);
+        /* TODO: order is unknown between IPIs and IRQs but we apply
+         * hw IRQs first
+         */
+        if (result_lines & (1<<i)) {
             /* HACK */
-            current_reason = (AIC_IRQ_HW<<16)|hw_irq[i];
-            qemu_irq_raise(s->irq_out[i]);
+            current_reason = (AIC_IRQ_HW<<16)|result_irqs[i];
+            aic_set_irq(s, i, AIC_IRQ_HIGH);
         } else if (valid_ipis & (1<<i)) {
-            /* Mask it first */
-            s->ipi_mask |= 1<<i;
             /* HACK */
             current_reason = (AIC_IRQ_IPI<<16);
             //printf("Raising IPI for CPU@%0x\n",i);
-            qemu_irq_raise(s->irq_out[i]);
+            aic_set_irq(s, i, AIC_IRQ_HIGH);
         } else {
             /* Nothing is raising the IRQ line */
-            qemu_irq_lower(s->irq_out[i]);
+            aic_set_irq(s, i, AIC_IRQ_LOW);
         }
-    }
-#endif
-    /* BIG BIG HACK */
-    uint32_t is_pending = aic_test_bit(605, s->irq_pending);
-    uint32_t mask = aic_test_bit(605, s->irq_mask);
-    uint32_t masked = is_pending & ~(mask);
-    static int raise_refcount = 0;
-    if (masked && (raise_refcount == 0)) {
-        raise_refcount++;
-        //printf("Raising IRQ %d\n", 605);
-        aic_clear_bit(605, s->irq_mask);
-        current_reason = (AIC_IRQ_HW<<16)|(605);
-        qemu_irq_raise(s->irq_out[0]);
-    } else if (!masked && (raise_refcount > 0)) {
-        raise_refcount = 0;
-        //printf("Lowering IRQ %d\n", 605);
-        qemu_irq_lower(s->irq_out[0]);
     }
 }
 
@@ -283,14 +347,22 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     case AIC_IRQ_REASON: /* AIC_IRQ_REASON */
     {
-        /* Reading this also handles acking an IRQ */
-        
-        /* TODO: Keep track of reasons such that we can tie them back
-         * when this is read, (we need the current CPU doing the read
-         * to do this
-         */
-        uint32_t old_reason = current_reason;
-        current_reason = 0;
+        /* Reading this also handles acking an IRQ (and masking it) */
+        /* TODO: move this to handler it's too big for the switch */
+        /* Must have a current reason to decode */
+        if (current_reason != 0) {
+            uint32_t reason_type = current_reason >> 16;
+            uint32_t reason_irq = current_reason & 0xFFFF;
+            //printf("Got reason of type=%0x, irq=%0x\n", reason_type, reason_irq);
+            switch (reason_type) {
+                case AIC_IRQ_IPI:
+                    s->ipi_mask |= ~0;
+                    break;
+                case AIC_IRQ_HW:
+                    aic_set_bit(reason_irq, s->irq_mask);
+                    break;
+            }
+        }
         /* TODO: Should we do an AIC update IRQ here since IRQ
          * was acked?*/
         /* NOTE: probably yes, since multiple IRQs could theoretically
@@ -311,18 +383,38 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
          * to understand what makes sense to implement here. For now
          * we don't support the reason being decoupled
          */
+        /*
+         * Above comment is old and I didn't read it to change it properly
+         * we call IRQ update after this beacuse after a higher priority
+         * IRQ is acked (reason is read) the existing IRQ is acked and then
+         * the next read will return the next set IRQ if IRQs are still
+         * pending. 
+         * NOTE: we assume here that hardware dynamically generates reason
+         * from the highest priority unmasked IRQ rather than say queuing
+         * up incoming IRQ events. The latter makes little sense to me
+         * at the moment but it's possible so noting it here.
+         */
+        uint32_t old_reason = current_reason;
+        current_reason = 0;
+        /* 
+         * TODO: make this not sound like nonsense
+         * NOTE: update must occur after we clear the reason
+         * since it will update it given that we have now
+         * masked the IRQ we have just asked by reading the reason
+         */
+        aic_update_irq(s);
         return old_reason;
     }
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
         return s->irq_dist[offset - AIC_DIST];
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
-        return s->sw_pending[(offset-AIC_SW_SET)/4];
+        return *aic_offset_ptr(offset, AIC_SW_SET, s->sw_pending);
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
-        return s->sw_pending[(offset-AIC_SW_CLEAR)/4];
+        return *aic_offset_ptr(offset, AIC_SW_CLEAR, s->sw_pending);
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        return s->irq_mask[(offset-AIC_MASK_SET)/4];
+        return *aic_offset_ptr(offset, AIC_MASK_SET, s->irq_mask);
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        return s->irq_mask[(offset-AIC_MASK_CLEAR)/4];
+        return *aic_offset_ptr(offset, AIC_MASK_CLEAR, s->irq_mask);
     case AIC_IPI_FLAG_SET:
     case AIC_IPI_FLAG_CLEAR:
         return s->ipi_pending;
@@ -335,8 +427,7 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
          */
         /* FIXME: bounds checking? */
         //printf("accessing irq_pending[%ld] = %d\n", (offset-AIC_HW_STATE)/4, s->irq_pending[(offset - AIC_HW_STATE)/4]);
-        return s->irq_pending[(offset-AIC_HW_STATE)/4];
-        //return *aic_bit_ptr((offset-AIC_HW_STATE)*32, s->irq_pending);
+        return *aic_offset_ptr(offset, AIC_HW_STATE, s->irq_pending);
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
@@ -348,32 +439,37 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
                          unsigned size)
 {
     AppleAICState *s = APPLE_AIC(opaque);
-    uint32_t value = val & 0xFFFFFFFF;
+    uint32_t value = val;
+    bool changed = false;
     switch (offset) {
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
-        s->irq_dist[offset - 0x3000] = value;
+        //printf("Writing IRQ dist %u\n", aic_offset_to_reg(offset, AIC_DIST));
+        aic_update_reg(offset, AIC_DIST, s->irq_dist, value);
+        /* TODO: should this call aic_update_irq? */
         break;
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
-        s->sw_pending[(offset-AIC_SW_SET)/4] |= value;
-        // TODO: proper irq input
-        aic_update_irq(s);
+        changed = aic_set_reg(offset, AIC_SW_SET, s->sw_pending, value);
+        if (changed) {
+            aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_SW_SET));
+        }
         break;
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
-        s->sw_pending[(offset-AIC_SW_CLEAR)/4] &= ~value;
-        // TODO: proper irq input
-        aic_update_irq(s);
+        changed = aic_clear_reg(offset, AIC_SW_CLEAR, s->sw_pending, value);
+        if (changed) {
+            aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_SW_CLEAR));
+        }
         break;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        s->irq_mask[(offset-AIC_MASK_SET)/4] |= value;
-        //printf("Setting mask IRQS %ld-%ld\n", (offset - AIC_MASK_SET)/4*32,(offset - AIC_MASK_SET)/4*32+31);
-        // TODO: only handle changes
-        aic_update_irq(s);
+        changed = aic_set_reg(offset, AIC_MASK_SET, s->irq_mask, value);
+        if (changed) {
+            aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_MASK_SET));
+        }
         break;
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        s->irq_mask[(offset-AIC_MASK_CLEAR)/4] &= ~value;
-        //printf("Clearing mask IRQS %ld-%ld\n", (offset - AIC_MASK_CLEAR)/4*32,(offset - AIC_MASK_CLEAR)/4*32+31);
-        // TODO: only handle changes
-        aic_update_irq(s);
+        changed = aic_clear_reg(offset, AIC_MASK_CLEAR, s->irq_mask, value);
+        if (changed) {
+            aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_MASK_CLEAR));
+        }
         break;
     case AIC_IPI_FLAG_SET:
         s->ipi_pending |= value;
@@ -454,6 +550,9 @@ static void apple_aic_realize(DeviceState *dev, Error **errp)
      * accessed by a single AIC */
     s->ipi_pending = 0;
     s->ipi_mask = ~0;
+    
+    /* We start will all lines low */
+    s->irq_out_status = 0;
     
     memory_region_init_io(&s->mmio_region, OBJECT(s), &aic_io_ops, s,
                           "aic-mmio", AIC_MMIO_SIZE);

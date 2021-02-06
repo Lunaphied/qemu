@@ -49,7 +49,13 @@
  * values to match the hardware. Other code in QEMU does similar and
  * the way the bitmap API works should probably be changes to handle
  * this problem
+ * TODO: move the seperate header
  */
+
+/* 
+ * This is the number of vaild uint32_t entries in the irq map
+ */
+#define AIC_IRQ_REG_COUNT DIV_ROUND_UP(AIC_NUM_IRQ, 32)
 
 /*
  * nbits must be a compile time constant
@@ -61,12 +67,82 @@
 #define AIC_BIT_WORD(nr) ((nr) / 32)
 
 /*
+ * Converts an offset value in the MMIO to an index in the
+ * array
+ */
+static inline uint32_t aic_offset_to_reg(hwaddr offset, hwaddr base)
+{
+    return (offset-base)/4;
+}
+
+/*
  * Returns a pointer accessing the 32-bit word containing
  * the specified bit
  */
 static inline uint32_t* aic_bit_ptr(int nr, uint32_t *addr)
 {
     return addr + AIC_BIT_WORD(nr);
+}
+
+/*
+ * Returns a pointer accessing the 32-bit word containing
+ * the specified register, this is intended as a helper function
+ * for the reader/writer MMIO handlers
+ */
+static inline uint32_t* aic_offset_ptr(hwaddr offset, hwaddr base,
+                                       uint32_t *addr)
+{
+    return addr + aic_offset_to_reg(offset, base);
+}
+
+/*
+ * Helper to update a register, returns true of there was a change
+ * in value, this is helpful since it tells the accessers when to
+ * update the IRQ status
+ */
+static inline bool aic_update_reg(hwaddr offset, hwaddr base, uint32_t *addr,
+                                  uint32_t value)
+{
+    uint32_t *p = aic_offset_ptr(offset, base, addr);
+    if (*p != value) {
+        *p = value;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Helper to update a register by setting bits, returns true if a change
+ * occured
+ */
+static inline bool aic_set_reg(hwaddr offset, hwaddr base, uint32_t *addr,
+                               uint32_t value)
+{
+    uint32_t *p = aic_offset_ptr(offset, base, addr);
+    uint32_t old_value = *p;
+    uint32_t new_value = old_value | value;
+    if (old_value != new_value) {
+        *p = new_value;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Helper to update a register by setting bits, returns true if a change
+ * occured
+ */
+static inline bool aic_clear_reg(hwaddr offset, hwaddr base, uint32_t *addr,
+                               uint32_t value)
+{
+    uint32_t *p = aic_offset_ptr(offset, base, addr);
+    uint32_t old_value = *p;
+    uint32_t new_value = old_value & ~value;
+    if (old_value != new_value) {
+        *p = new_value;
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -150,6 +226,13 @@ struct AppleAICState {
     uint32_t num_cpu;
     /* TODO: Make this allocated based on num-cpus */
     qemu_irq irq_out[AIC_MAX_CPUS];
+    /* 
+     * Keep track of current line state for output IRQs
+     * this is less of an optimization and more of a helper for
+     * debug prints so they don't spam with redundent changes
+     * NOTE: depends on AIC_MAX_CPUS being <= 32 
+     */
+    uint32_t irq_out_status;
     
     /* 
      * NOTE: These are declared as compiled time constants
@@ -170,6 +253,7 @@ struct AppleAICState {
     /* Mask and pending for IPIs */
     uint32_t ipi_mask;
     uint32_t ipi_pending;
+    
     
     /* TODO: This might need to be a hashtabe to not take up a huge amount
      * of memory just for IRQ distribution storage? */
