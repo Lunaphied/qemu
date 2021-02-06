@@ -325,6 +325,15 @@ static const ARMCPRegInfo apple_firestorm_cp_reginfo[] = {
     { .name = "FIRESTORM_MISC12_EL2", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 1, .opc2 = 4,
       .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC13", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 3, .crn = 15, .crm = 0, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC14_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 4, .crn = 15, .crm = 0, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "FIRESTORM_MISC15_EL2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 6, .crn = 15, .crm = 0, .opc2 = 0,
+      .access = PL2_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
     REGINFO_SENTINEL
 };
 

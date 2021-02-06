@@ -157,18 +157,6 @@ static inline bool aic_irq_valid(AppleAICState *s, int n)
     return true;
 }
 
-/*
- * Returns if a given HW IRQ is currently pending
- */
-static inline bool aic_is_irq_pending(AppleAICState *s, int n)
-{
-    if (!aic_irq_valid(s, n)) {
-        return false;
-    }
-    /* FIXME: Macros */
-    return !!(s->irq_pending[n/32] & (n & 0x1F));
-}
-
 /* Handle updating and initiating IRQs after applying masks */
 static void aic_update_irq(AppleAICState *s)
 {
@@ -266,14 +254,14 @@ static void aic_update_irq(AppleAICState *s)
     }
 #endif
     /* BIG BIG HACK */
-    uint32_t is_pending = s->irq_pending[18] & (1<<29);
-    uint32_t mask = s->irq_mask[18] & (1<<29);
+    uint32_t is_pending = aic_test_bit(605, s->irq_pending);
+    uint32_t mask = aic_test_bit(605, s->irq_mask);
     uint32_t masked = is_pending & ~(mask);
     static int raise_refcount = 0;
     if (masked && (raise_refcount == 0)) {
         raise_refcount++;
         //printf("Raising IRQ %d\n", 605);
-        s->irq_mask[18] |= (1<<29);
+        aic_clear_bit(605, s->irq_mask);
         current_reason = (AIC_IRQ_HW<<16)|(605);
         qemu_irq_raise(s->irq_out[0]);
     } else if (!masked && (raise_refcount > 0)) {
@@ -305,21 +293,36 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         current_reason = 0;
         /* TODO: Should we do an AIC update IRQ here since IRQ
          * was acked?*/
+        /* NOTE: probably yes, since multiple IRQs could theoretically
+         * be queued at once on hardware there could be multiple valid
+         * IRQs occuring with unique event codes, reading it again
+         * would get the next highest priority event. On QEMU everything
+         * is synchronous (at least for now?) such that no code gets 
+         * to set IRQs simultaneously with other code (and even if it did)
+         * there would probably be a total order? (this is probably
+         * nonsense whatever).
+         * 
+         * The result is it simply probably doesn't matter on qemu except 
+         * in the case that there was an existing IRQ, we reenabled IRQs
+         * to allow ourselves to be preempted by a higher priority IRQ
+         * and then the hardware sends us another IRQ and we want to
+         * go handle that. I'm fairly sure Linux might actually do this
+         * but we need to understand what the real AIC does in that case
+         * to understand what makes sense to implement here. For now
+         * we don't support the reason being decoupled
+         */
         return old_reason;
     }
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
         return s->irq_dist[offset - AIC_DIST];
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
-        /* TODO: This would have to get an IRQ's status I think */
-        /* or we would have to shadow it */
-        return 0;
+        return s->sw_pending[(offset-AIC_SW_SET)/4];
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
-        /* TODO: Same as AIC_SW_SET */
-        return 0;
+        return s->sw_pending[(offset-AIC_SW_CLEAR)/4];
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        return s->irq_mask[(offset - AIC_MASK_SET)/4];
+        return s->irq_mask[(offset-AIC_MASK_SET)/4];
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        return s->irq_mask[(offset - AIC_MASK_CLEAR)/4];
+        return s->irq_mask[(offset-AIC_MASK_CLEAR)/4];
     case AIC_IPI_FLAG_SET:
     case AIC_IPI_FLAG_CLEAR:
         return s->ipi_pending;
@@ -330,9 +333,10 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* Get the current pending value which is what I think this
          * does on hardware
          */
-        /* FIXME: bounds checking */
-        printf("accessing irq_pending[%ld] = %d\n", (offset-AIC_HW_STATE)/4, s->irq_pending[(offset - AIC_HW_STATE)/4]);
-        return s->irq_pending[(offset - AIC_HW_STATE)/4];
+        /* FIXME: bounds checking? */
+        //printf("accessing irq_pending[%ld] = %d\n", (offset-AIC_HW_STATE)/4, s->irq_pending[(offset - AIC_HW_STATE)/4]);
+        return s->irq_pending[(offset-AIC_HW_STATE)/4];
+        //return *aic_bit_ptr((offset-AIC_HW_STATE)*32, s->irq_pending);
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
@@ -344,51 +348,50 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
                          unsigned size)
 {
     AppleAICState *s = APPLE_AIC(opaque);
+    uint32_t value = val & 0xFFFFFFFF;
     switch (offset) {
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
-        s->irq_dist[offset - 0x3000] = val & 0xFFFFFFFF;
+        s->irq_dist[offset - 0x3000] = value;
         break;
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
-        /* TODO: This would have to raise the IRQ line */
+        s->sw_pending[(offset-AIC_SW_SET)/4] |= value;
         // TODO: proper irq input
         aic_update_irq(s);
         break;
     case AIC_SW_CLEAR ... AIC_SW_CLEAR_END: /* AIC_SW_CLEAR */
-        /* TODO: And this would have to lower it if HW isn't
-         * driving it (so we need an OR effectively)
-         */
+        s->sw_pending[(offset-AIC_SW_CLEAR)/4] &= ~value;
         // TODO: proper irq input
         aic_update_irq(s);
         break;
     case AIC_MASK_SET ... AIC_MASK_SET_END: /* AIC_MASK_SET */
-        s->irq_mask[(offset - AIC_MASK_SET)/4] |= val & 0xFFFFFFFF;
+        s->irq_mask[(offset-AIC_MASK_SET)/4] |= value;
         //printf("Setting mask IRQS %ld-%ld\n", (offset - AIC_MASK_SET)/4*32,(offset - AIC_MASK_SET)/4*32+31);
         // TODO: only handle changes
         aic_update_irq(s);
         break;
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
-        s->irq_mask[(offset - AIC_MASK_CLEAR)/4] &= ~(val & 0xFFFFFFFF);
+        s->irq_mask[(offset-AIC_MASK_CLEAR)/4] &= ~value;
         //printf("Clearing mask IRQS %ld-%ld\n", (offset - AIC_MASK_CLEAR)/4*32,(offset - AIC_MASK_CLEAR)/4*32+31);
         // TODO: only handle changes
         aic_update_irq(s);
         break;
     case AIC_IPI_FLAG_SET:
-        s->ipi_pending |= (val & 0xFFFFFFFF);
+        s->ipi_pending |= value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
     case AIC_IPI_FLAG_CLEAR:
-        s->ipi_pending &= ~(val & 0xFFFFFFFF);
+        s->ipi_pending &= ~value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
     case AIC_IPI_MASK_SET: 
-        s->ipi_mask |= (val & 0xFFFFFFFF);
+        s->ipi_mask |= value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
     case AIC_IPI_MASK_CLEAR:
-        s->ipi_mask &= ~(val & 0xFFFFFFFF);
+        s->ipi_mask &= ~value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
@@ -419,10 +422,10 @@ static void aic_irq_handler(void *opaque, int n, int level)
         /* The logic below is too confusing, wrap in macros or
          * an inline function (inline functions seem cleaner */
         if (level) {
-            s->irq_pending[n/32] |= 1<<(n & 0x1F);
+            aic_set_bit(n, s->irq_pending);
             //printf("irq_pending[%d] |= %d\n", n/32, n & 0x1F);
         } else {
-            s->irq_pending[n/32] &= ~(1<<(n & 0x1F));
+            aic_clear_bit(n, s->irq_pending);
             //printf("irq_pending[%d] &= ~(%0x)\n", n/32, 1<<(n & 0x1F));
         }
     }
@@ -439,13 +442,18 @@ static void apple_aic_realize(DeviceState *dev, Error **errp)
     s->num_cpu = AIC_MAX_CPUS;
     
     /* Clear state */
-    /* TODO: /32 is really not ideal, use some sort of BITS wrapper */
-    for (int i = 0; i < (s->num_irq/32); i++) {
-        /* IRQs are cleared by default */
-        s->irq_pending[i] = 0;
-        /* Masks are set by default */
-        s->irq_mask[i] = ~0;
-    }
+    /* NOTE: These use compile time constants to get better
+     * generated code even if it is less generic
+     */
+    aic_zero_bits(s->sw_pending, AIC_NUM_IRQ);
+    
+    aic_zero_bits(s->irq_pending, AIC_NUM_IRQ);
+    aic_fill_bits(s->irq_mask, AIC_NUM_IRQ);
+    
+    /* NOTE: IPIs are capped to at most having 32 CPUs
+     * accessed by a single AIC */
+    s->ipi_pending = 0;
+    s->ipi_mask = ~0;
     
     memory_region_init_io(&s->mmio_region, OBJECT(s), &aic_io_ops, s,
                           "aic-mmio", AIC_MMIO_SIZE);
