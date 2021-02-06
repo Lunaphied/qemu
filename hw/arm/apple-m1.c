@@ -183,7 +183,7 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     DeviceState *uart = qdev_new("exynos4210.uart");
     object_property_add_child(OBJECT(s), "uart", OBJECT(uart));
     qdev_prop_set_chr(uart, "chardev", serial_hd(0));
-    //qdev_prop_set_uint32(uart, "rx-size", 0x10000); // Give the serial port an insane buffer to speed up code loads
+    qdev_prop_set_uint32(uart, "rx-size", 4096*32); // Give the serial port an insane buffer to speed up code loads
     sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_abort);
     // XXX: Currently the FIFO reset state is changed so that it's ready for FIFO usage before m1n1 starts
     // the correct solution is probably to have m1n1 specifically enable the FIFO or add a pre-m1n1 boot stub

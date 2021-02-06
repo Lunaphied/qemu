@@ -224,6 +224,7 @@ exynos4210_uart_Rx_FIFO_trigger_level(const Exynos4210UartState *s)
     return exynos4210_uart_FIFO_trigger_level(s->channel, reg);
 }
 
+
 /*
  * Update Rx DMA busy signal if Rx DMA is enabled. For simplicity,
  * mark DMA as busy if DMA is enabled and the receive buffer is empty.
@@ -533,7 +534,7 @@ static void exynos4210_uart_receive(void *opaque, const uint8_t *buf, int size)
             size = fifo8_num_free(&s->rx);
             s->reg[I_(UINTSP)] |= UINTSP_ERROR;
         }
-	fifo8_push_all(&s->rx, buf, size);
+        fifo8_push_all(&s->rx, buf, size);
         exynos4210_uart_rx_timeout_set(s);
     } else {
         s->reg[I_(URXH)] = buf[0];
@@ -552,7 +553,7 @@ static void exynos4210_uart_event(void *opaque, QEMUChrEvent event)
         /* When the RxDn is held in logic 0, then a null byte is pushed into the
          * fifo */
         // FIXME: Does this logic trigger only when the FIFO is enabled on hardware?
-	fifo8_push(&s->rx, '\0');
+        fifo8_push(&s->rx, '\0');
         s->reg[I_(UERSTAT)] |= UERSTAT_BREAK;
         exynos4210_uart_update_irq(s);
     }
