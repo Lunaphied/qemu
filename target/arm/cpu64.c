@@ -377,6 +377,20 @@ static void aapl_firestorm_initfn(Object *obj)
     define_arm_cp_regs(cpu, apple_firestorm_cp_reginfo);
 }
 
+
+static const ARMCPRegInfo apple_icestorm_cp_reginfo[] = {
+    { .name = "ICESTORM_MISC1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 9, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "ICESTORM_MISC2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 10, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "ICESTORM_MISC2", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 1, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    REGINFO_SENTINEL
+};
+
 // TODO: see aapl_firestorm_initfn
 static void aapl_icestorm_initfn(Object *obj)
 {
@@ -388,8 +402,10 @@ static void aapl_icestorm_initfn(Object *obj)
     aapl_firestorm_initfn(obj);
     /* Implementer is Apple, varient is 0, arch is 
      * elsewhere part is icestorm */
-    ARM_CPU(obj)->midr = 0x610F0220;
-    ARM_CPU(obj)->dtb_compatible = "AAPL,icestorm";
+    ARMCPU *cpu = ARM_CPU(obj);
+    cpu->midr = 0x610F0220;
+    cpu->dtb_compatible = "AAPL,icestorm";
+    define_arm_cp_regs(cpu, apple_icestorm_cp_reginfo);
 }
 
 void arm_cpu_sve_finalize(ARMCPU *cpu, Error **errp)

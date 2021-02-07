@@ -28,6 +28,7 @@
 #include "exec/exec-all.h"
 #include "sysemu/reset.h"
 #include "hw/misc/unimp.h"
+#include "arm-powerctl.h"
 #include "hw/arm/apple-m1.h"
 
 // Notes on this file:
@@ -51,13 +52,20 @@
 #define RAMLIMIT_GB     8192
 #define RAMLIMIT_BYTES  (RAMLIMIT_GB * GiB)
 
+/* 
+ * TODO: this way of mapping memory is probably not ideal, (it's hard to add
+ * multiple regions of ram split by IO, we should instead construct this from
+ * a dtb conversion of an ADT from a real Mac Mini
+ */
 enum {
-    M1_MEM,   // A block of ram
-    M1_UART,  // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
-    M1_AIC,   // The Apple interrupt controller
-    M1_WDT,   // The M1 Watchdog timer. This is probably actually part of the AIC
-    M1_ROM,   // We setup a block of ROM to make pretend boot arguments to match what the real hardware does
-    M1_FB,    // The m1n1 code expects a framebuffer, for now this just means to dump ram in this region
+    M1_MEM,         // The main memory for the M1
+    M1_UART,        // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
+    M1_AIC,         // The Apple interrupt controller
+    M1_WDT,         // The M1 Watchdog timer. This is probably actually part of the AIC
+    M1_ROM,         // We setup a block of ROM to keep the initial boot code in
+    M1_ARGS,        // A bit of ROM to hold the bootargs
+    M1_FB,          // The M1N1 code expects a framebuffer, for now this just means to dump ram in this region
+    M1_PMGR,        // Peripheral used to set cores to on (and theoretically off) along with giving them a reset vector address to start at
 };
 // This is used in several other ARM platforms to help collect the addresses and give them meaningful names
 // during realization. These aren't correlated to the M1 hardware at all though it's just easier to set
@@ -65,9 +73,12 @@ enum {
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
     [M1_ROM] =              {         0x0,              0x10000},
+    //[M1_SPINTABLE] =        {     0x10000,                0x100},
     [M1_UART] =             { 0x235200000,              0x10000},
     [M1_AIC] =              { 0x23B100000,              0x10000},
     [M1_WDT] =              { 0x23D2B0000,                0x100},
+    /* TODO: replace this with a real addr from hardware */
+    [M1_PMGR] =             { 0x23D300000,                0x100},
     [M1_FB] =               { 0x300000000,                8*GiB},
     [M1_MEM] =              { 0x800000000,       RAMLIMIT_BYTES},
 };
@@ -89,6 +100,136 @@ static hwaddr device_tree_end = 0;
  * alone or a collection of M1N1+linux+device tree+initrd)
  */
 static hwaddr safe_ram_start = 0;
+
+/* Helper function to construct mp_affinity from cluster and core */
+static inline uint32_t m1_mp_affinity(uint32_t cluster, uint32_t core)
+{
+    return (cluster << 8) | (core & 0xFF);
+}
+
+/* 
+ * Simple power management/startup unit emulation to match the M1, this could
+ * probably be replicated without using an actual IO peripheral by just using
+ * modified startup code, but that can't set the reset vectors so we use this
+ */
+static uint64_t m1_pmgr_read(void *opaque, hwaddr offset, unsigned size)
+{
+    AppleM1State *s = APPLE_M1(opaque);
+    /* TODO this code assumes you're using 32 bit reads except for the RVBAR addr */
+    switch (offset) {
+    case 0x4:
+    case 0x8:
+    case 0xC:
+        /* Ignore all these reads (maybe we'll have to report what was written) */
+        break;
+    case 0x10 ... 0x50:
+    {
+        /* There's no specific offset for setting the reset vectors so stick them here */
+        uint32_t cpuid = (offset - 0x10)/8;
+        uint32_t cluster = cpuid / 8;
+        uint32_t coreid = cpuid % 8;
+        if (cluster) {
+            /* Performance cores */
+            return s->firestorm_cores[coreid].rvbar;
+        } else {
+            /* Efficiency cores */
+            return s->icestorm_cores[coreid].rvbar;
+        }
+    }   
+    default:
+        qemu_log("M1 PMGR: Unhandled read of @ %#lx\n", offset);
+        break;
+    }
+    return 0;
+}
+
+static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+{
+    AppleM1State *s = APPLE_M1(opaque);
+    /* TODO This code assumes you're using 32 bit writes except for the RVBAR addr */
+    uint32_t value = val;
+    switch (offset) {
+    case 0x4: 
+        /* M1N1 describes this as a system level startup bit we just ignore */
+        break;
+    case 0x8:
+        /* This is where we startup one of the efficiency cores */
+        //qemu_log("Efficiency core startup: %#x\n", value);
+        for (int i = ctz32(value); i < APPLE_M1_ICESTORM_CPUS; i++) {
+            if (value & (1<<i)) {
+                ARMCPU *cpu = &s->icestorm_cores[i];
+                if (cpu->power_state == PSCI_OFF) {
+                    qemu_log("Starting ICESTORM core #%u\n", i);
+                    arm_set_cpu_on_and_reset(cpu->mp_affinity);
+                }
+                //qemu_log("Power state was: %#x\n", s->icestorm_cores[i].power_state);
+                //qemu_log("RVBAR was: %#lx\n", s->icestorm_cores[i].rvbar);
+            }
+        }
+        break;
+    case 0xC:
+        /* This is where we startup one of the performance cores */
+        //qemu_log("Performance core startup: %#x\n", value);
+        for (int i = ctz32(value); i < APPLE_M1_FIRESTORM_CPUS; i++) {
+            if (value & (1<<i)) {
+                ARMCPU *cpu = &s->firestorm_cores[i];
+                if (cpu->power_state == PSCI_OFF) {
+                    qemu_log("Starting FIRESTORM core #%u\n", i);
+                    arm_set_cpu_on_and_reset(cpu->mp_affinity);
+                }
+                //qemu_log("Power state was: %#x\n", s->firestorm_cores[i].power_state);
+                //qemu_log("RVBAR was: %#lx\n", s->firestorm_cores[i].rvbar);
+            }
+        }
+        break;
+    case 0x10 ... 0x50:
+    {
+        /* There's no specific offset for setting the reset vectors so stick them here */
+        uint32_t cpuid = (offset - 0x10)/8;
+        uint32_t cluster = cpuid / 4;
+        uint32_t coreid = cpuid % 4;
+        printf("Offset is %0lx, Size is %0x, val is %0lx\n", offset, size, val);
+        printf("coreid = %#x\n", coreid);
+        /* 
+         * FIXME:
+         * Apparently 64 bit accessed don't... actually work, handle split
+         * accesses
+         */
+        int half = ((offset - 0x10)/4) % 2;
+        printf("half = %#x\n", half);
+        uint64_t *p = NULL;
+        if (cluster) {
+            /* Performance cores */
+            p = &s->firestorm_cores[coreid].rvbar;
+        } else {
+            /* Efficiency cores */
+            p = &s->icestorm_cores[coreid].rvbar;
+        }
+        if (half) {
+            /* Handle writing the top half */
+            uint64_t new_val = *p & 0xFFFFFFFF;
+            new_val |= (val<<32);
+            *p = new_val;
+        } else {
+            /* Handle writing the bottom half */
+            uint64_t new_val = *p & (0xFFFFFFFFUL<<32);
+            new_val |= val;
+            *p = new_val;
+        }
+        break;
+    }
+    default:
+        qemu_log("M1 PMGR: Unhandled write of %#x to %#lx\n", value, offset);
+        break;
+    }
+}
+
+static const MemoryRegionOps m1_pmgr_ops = {
+    .read = m1_pmgr_read,
+    .write = m1_pmgr_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
 
 static void apple_m1_init(Object *obj) {
     AppleM1State *s = APPLE_M1(obj);
@@ -156,7 +297,7 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
         // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
         // Disable CPU 
         object_property_set_bool(OBJECT(&s->firestorm_cores[i]), 
-                                 "start-powered-off", i > 0, &error_abort);
+                                 "start-powered-off", true, &error_abort);
         // TODO: Better way?
         qdev_prop_set_uint64(DEVICE(&s->firestorm_cores[i]), "mp-affinity", (0x101<<8)|i);
         qdev_realize(DEVICE(&s->firestorm_cores[i]), NULL, &error_abort);
@@ -170,7 +311,7 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
         // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
         // Disable CPU 
         object_property_set_bool(OBJECT(&s->icestorm_cores[i]), 
-                                 "start-powered-off", true, &error_abort);
+                                 "start-powered-off", i > 0, &error_abort);
         // TODO: Better way?
         qdev_prop_set_uint64(DEVICE(&s->icestorm_cores[i]), "mp-affinity", i);
         qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
@@ -220,16 +361,16 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     
     // Connect the output to the FIQ input
     qdev_connect_gpio_out(fiq_or, 0, 
-                          qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
+                          qdev_get_gpio_in(DEVICE(&s->icestorm_cores[0]),
                                            ARM_CPU_FIQ));
     // Connect all of the timers as potential FIQ inputs fr good measure
-    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_PHYS,
+    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_PHYS,
                           qdev_get_gpio_in(fiq_or, 0));
-    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_VIRT,
+    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_VIRT,
                           qdev_get_gpio_in(fiq_or, 1));
-    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_HYP,
+    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_HYP,
                           qdev_get_gpio_in(fiq_or, 2));
-    qdev_connect_gpio_out(DEVICE(&s->firestorm_cores[0]), GTIMER_SEC,
+    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_SEC,
                           qdev_get_gpio_in(fiq_or, 3));
     
     sysbus_realize(SYS_BUS_DEVICE(&s->aic), &error_fatal);
@@ -261,7 +402,17 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     
     // FIXME: Do this properly
     // Add a reset hook for the first core that will pull in the correct x0 reg for boot_args
-    qemu_register_reset(handle_m1_reset, &s->firestorm_cores[0]);
+    qemu_register_reset(handle_m1_reset, &s->icestorm_cores[0]);
+    /* TODO: add a reset handler that handles resetting secondaries */
+    
+    /* Add the power manager peripheral */
+    /* TODO: This needs to be real device added to the AppleM1State struct */
+    
+    MemoryRegion *pmgr_mr = g_new0(MemoryRegion, 1);
+    memory_region_init_io(pmgr_mr, OBJECT(s), &m1_pmgr_ops, DEVICE(s), "m1-pmgr",
+                          memmap[M1_PMGR].size);
+    memory_region_add_subregion(get_system_memory(), memmap[M1_PMGR].base,
+                                pmgr_mr);
 }
 
 static void apple_m1_class_init(ObjectClass *oc, void *data) { 
@@ -561,7 +712,7 @@ static void m1_mac_init(MachineState *machine)
     }
     /* TODO: do this in a better way or not at all it's helpful for dev tho */
     FILE *fconfig = fopen("boot_params.config", "w");
-    if (fconfig >= 0) {
+    if (fconfig != NULL) {
         if (kernel_base) {
             fprintf(fconfig, "kernel\t0x%lx\t0x%x\n", kernel_base, kernel_size);
         }

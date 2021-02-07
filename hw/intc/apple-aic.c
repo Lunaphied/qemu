@@ -53,6 +53,9 @@
 
 #include "qemu/osdep.h"
 #include "hw/irq.h"
+#include "hw/core/cpu.h" /* HACK this is only here for getting current core */
+#include "cpu.h"
+#include "qemu/timer.h"
 #include "hw/intc/apple-aic.h"
 
 /* TODO: Add tracing */
@@ -106,6 +109,10 @@
 #define AIC_IPI_MASK_SET    0x2024
 #define AIC_IPI_MASK_CLEAR  0x2028
 
+/* Timer passthrough */
+#define AIC_TIMER_LOW       0x8020
+#define AIC_TIMER_HIGH      0x8028
+
 /* IRQ reasons (reported by reason register) */
 #define AIC_IRQ_HW  (1<<0)
 #define AIC_IRQ_IPI (1<<2)
@@ -158,6 +165,16 @@ static inline bool aic_irq_valid(AppleAICState *s, int n)
         return false;
     }
     return true;
+}
+
+/*
+ * TODO: this seems to be the only possible way to get the 
+ * CPU timer (even with a reference!) we just get the 
+ * freq and use the clock to emulate 
+ */
+static inline uint64_t aic_emulate_timer(ARMCPU *cpu)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
 }
 
 /* 
@@ -415,11 +432,11 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         return *aic_offset_ptr(offset, AIC_MASK_SET, s->irq_mask);
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
         return *aic_offset_ptr(offset, AIC_MASK_CLEAR, s->irq_mask);
-    case AIC_IPI_FLAG_SET:
-    case AIC_IPI_FLAG_CLEAR:
+    case AIC_IPI_FLAG_SET:      /* AIC_IPI_FLAG_SET */
+    case AIC_IPI_FLAG_CLEAR:    /* AIC_IPI_FLAG_CLEAR */
         return s->ipi_pending;
-    case AIC_IPI_MASK_SET: 
-    case AIC_IPI_MASK_CLEAR:
+    case AIC_IPI_MASK_SET:      /* AIC_IPI_MASK_SET */
+    case AIC_IPI_MASK_CLEAR:    /* AIC_IPI_MASK_CLEAR */
         return s->ipi_mask;
     case AIC_HW_STATE ... AIC_HW_STATE_END: /* State of input HW lines */
         /* Get the current pending value which is what I think this
@@ -428,6 +445,12 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* FIXME: bounds checking? */
         //printf("accessing irq_pending[%ld] = %d\n", (offset-AIC_HW_STATE)/4, s->irq_pending[(offset - AIC_HW_STATE)/4]);
         return *aic_offset_ptr(offset, AIC_HW_STATE, s->irq_pending);
+    case AIC_TIMER_LOW: /* Lower 32 bits of the CNTPCT_EL0 timer */
+        /* TODO: this is bad and broken, we need per-cpu state to do this */
+        return aic_emulate_timer(ARM_CPU(current_cpu)) & 0xFFFFFFFF;
+    case AIC_TIMER_HIGH: /* Upper 32 bits of the CNTPCT_EL0 timer */
+        /* TODO: this is bad and broken, we need per-cpu state to do this */
+        return (aic_emulate_timer(ARM_CPU(current_cpu)) >> 32) & 0xFFFFFFFF;
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
