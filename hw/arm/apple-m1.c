@@ -76,7 +76,19 @@ static const struct MemMapEntry memmap[] = {
 // and device create creation code, also those should be stuffed in ram that's
 // initialized at boot instead of into ROM, ROM should be tiny and used for
 // initializing stuff before jumping in
-static hwaddr device_tree_end;
+static hwaddr device_tree_end = 0;
+
+/*
+ * TODO: get rid of this? (or split the boot code into it's own file maybe
+ *       a lot of this process for boot is similar to the unique process
+ *       that the x86 microvm does (specifically the PVH load))
+ */
+
+/* 
+ * This stores the first address after the loaded kernel (which might be M1N1
+ * alone or a collection of M1N1+linux+device tree+initrd)
+ */
+static hwaddr safe_ram_start = 0;
 
 static void apple_m1_init(Object *obj) {
     AppleM1State *s = APPLE_M1(obj);
@@ -277,9 +289,6 @@ static void apple_m1_register_types(void)
 
 type_init(apple_m1_register_types);
 
-static struct arm_boot_info m1_boot_info;
-
-
 // This builds an apple style device tree then inserts it into memory somewhere, 
 // TODO: Make this a lot nicer (model after the virt platform fdt builders)
 // it should be dynamic (ideally we would take an existing device tree from
@@ -366,6 +375,10 @@ static void create_apple_dt(MachineState *machine) {
 // This builds and then inserts a boot args structure like m1n1 and OS X expect
 // it then puts it into memory (I've moved it to 0x10 so that it's not set to
 // a null pointer)
+/* 
+ * NOTE: Must be called after the data is loaded into memory since it relies
+ * on safe_ram_start being defined
+ */
 static void create_boot_args(MachineState *machine) {
     struct {
         uint16_t revision;
@@ -392,7 +405,7 @@ static void create_boot_args(MachineState *machine) {
     bootargs.virtual_load_base = memmap[M1_MEM].base;
     bootargs.physical_load_base = memmap[M1_MEM].base;
     bootargs.memory_size = machine->ram_size;
-    bootargs.loaded_end = memmap[M1_MEM].base + 0x100000;  // FIXME: I just chose a large value big enough for current m1n1 not safe
+    bootargs.loaded_end = safe_ram_start;
     bootargs.fb_addr = memmap[M1_FB].base;
     bootargs.fb_stride = BOOTARGS_FB_STRIDE;
     bootargs.fb_width = BOOTARGS_FB_WIDTH;
@@ -418,65 +431,161 @@ static void m1_mac_init(MachineState *machine)
 
     m1 = APPLE_M1(qdev_new(TYPE_APPLE_M1));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
-    //CPU(&m1->maincore)->memory = machine->ram;
     qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
 
     // This initializes the memory region map
     MemoryRegion *sysmem = get_system_memory();
 
-    // doesn't this leak?
+    /* 
+     * I think it's okay that this doesn't get freed later since many machines
+     * create unfreed memory in their init, since it seems machines aren't meant
+     * to be created multiple times ever, it's also the only way to create
+     * anonymous MemoryRegion blocks which is helpful when you have lots of them
+     * and don't need to keep the pointers other than for potential freeing
+     */
+    /* Create a memory region for the boot arguments (boot_args, ADT, startup code) */
     MemoryRegion *boot_args = g_new0(MemoryRegion, 1);
-    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[M1_ROM].size, &error_abort);
+    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[M1_ROM].size,
+                           &error_abort);
+    /* Add the ROM region to the system memory map */
     memory_region_add_subregion(sysmem, memmap[M1_ROM].base, boot_args);
-
-    // XXX: FB stuff was implemented and moved into soc this isn't needed anymore as far as I know
-    // Again this should probably go in the SoC state struct or the machine struct (probably the SoC since it's all)
-    // technically part of the M1 itself unlike most things (raspi SoC is again a good reference)
-    // MemoryRegion *fb_mem = g_new0(MemoryRegion, 1);
-    //memory_region_init_ram(fb_mem, NULL, "framebuffer", memmap[VIRT_FB].size, &error_abort);
-    //memory_region_add_subregion(sysmem, memmap[VIRT_FB].base, fb_mem);
+    /* Add the RAM created for us to the main system memory space */
     memory_region_add_subregion(sysmem, memmap[M1_MEM].base, machine->ram);
-
-    // Add apple flavored device tree
-    create_apple_dt(machine);
-    // Add boot args
-    create_boot_args(machine);
-
-    // XXX: These are unused but we leave temporarily 
-    m1_boot_info.loader_start = memmap[M1_MEM].base;
-    m1_boot_info.ram_size = machine->ram_size;
 
     /* This is for loading M1N1 which acts as a sort of replacement firmware */
     /* We will want to do some sort of stub firmware loader first before M1N1
      * to setup the registers and boot args it expects, but for now we abuse
      * the reset handler and use ROM regions (we want to replace these with RAM
      * that reloads on CPU reset or something)
+     * 
+     * NOTE: we cannot really use the helper functions from arm/boot.c because
+     * loading elfs offers no control over the load address (it just uses the
+     * physical values which are offset from 0 for m1n1), we also want to start
+     * M1N1 with certain register and memory regions setup like iBoot would with
+     * info about the hardware (Apple's form of DTB)
+     * 
+     * We want to support this boot process in addition to a semi-standard
+     * "just load the kernel" method where we can directly load the kernel,
+     * however to do that we need to patch a fdt so that it has the dynamic
+     * info like CPU spintable addresses and framebuffer address. Since Linux
+     * can be loaded directly we can just do this the standard way, but then
+     * the code isn't really emulating an Apple M1 based Mac anymore, just a
+     * ARM64 Mac with some of the M1's peripherals, which is a lot easier to
+     * implement but not likely a good starting point if you want to also
+     * support emulation of OS X which is indeed an important goal here.
+     * 
+     * For now we have a compromise. M1N1 is loaded as "firmware" which
+     * essentially means we just grab the mach-o (which is intended to be loaded
+     * as a flat image with a fixed entry point) and dump it into memory, setup
+     * the required boot arguments (because only QEMU knows the values for
+     * those) and jump in, with some helper code to dump a kernel, initrd and
+     * dtb into memory so that proxy code can start it without copying it over
+     * the serial port. When I pull in the latest M1N1 changes again this can
+     * likely be changed to append the image like a concatenated M1N1 (but done
+     * dynamically in QEMU) so the proxy part wouldn't be needed.
+     * 
+     * In the future we may want to support directly starting linux without
+     * a bootloader if M1N1 isn't provided, this will likely be required for
+     * upstream merge and offers helpful features like not having to fuss with
+     * ADT stuff since a standard FDT can be easily constructed using QEMU
+     * helpers.
+     * 
+     * TL;DR There's a plan for loading, for now it's almost the simplest thing
+     * but not quite.
      */
+    safe_ram_start = memmap[M1_MEM].base;
+    
+    /* Keeps base and size so we can write a boot_param.config for qemu loader */
+    hwaddr kernel_base = 0;
+    int kernel_size = 0;
+    hwaddr dtb_base = 0;
+    int dtb_size = 0;
+    hwaddr initrd_base = 0;
+    int initrd_size = 0;
+    
     if (machine->firmware) {
-        printf("Found firmware: %s\n", machine->firmware);
-        if (load_image_targphys(machine->firmware, memmap[M1_MEM].base,
-                                memmap[M1_MEM].size) < 0) {
+        /* Align firmware to a 4K page */
+        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 4096);
+        //printf("Found firmware: %s\n", machine->firmware);
+        int load_size = load_image_targphys(machine->firmware, safe_ram_start,
+                                        memmap[M1_MEM].size);
+        if (kernel_size < 0) {
             error_report("Failed to load firmware from %s", machine->firmware);
             exit(1);
         }
+        printf("Firmware loaded@%0lx size=%0x\n", safe_ram_start, load_size);
+        safe_ram_start += load_size;
     }
-
-
-    // TODO: Replace this with a stubbed bootloader that loads the registers peroply
-    // and loads a kernel blob into memory and then jumps into that kernel blob
-    // we can probably implement enough macho parsing to grab the entry point
-
-    // XXX: This only works with a raw m1n1 elf because of patches to the laod elf that will break other users
-    //      should be replaced with a very simple loader for mach-o's or a seperate firmware bootloader
-    //      support for the firmware bootloader path would need to be added I think to do this right?
-    //      (TODO: look at the raspbery pi code which needs to do something similar)
-    // arm_load_kernel(ARM_CPU(first_cpu), machine, &m1_boot_info);
-    // If this value isn't at least 0x10000, something is wrong
-    //printf("Entry after load: %lx\n", m1_boot_info.entry);
+    
+    if (machine->kernel_filename) {
+        /* Align kernel to a 2MB addr */
+        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 2 * 1024 * 1024);
+        kernel_base = safe_ram_start;
+        printf("Found kernel: %s\n", machine->kernel_filename);
+        kernel_size = load_image_targphys(machine->kernel_filename, kernel_base,
+                                        memmap[M1_MEM].size);
+        if (kernel_size < 0) {
+            error_report("Failed to load kernel from %s", machine->kernel_filename);
+            exit(1);
+        }
+        printf("Kernel loaded@%0lx size=%0x\n", kernel_base, kernel_size);
+        safe_ram_start += kernel_size;
+    }
+    
+    if (machine->dtb) {
+        printf("Found dtb: %s\n", machine->dtb);
+        dtb_base = safe_ram_start;
+        dtb_size = load_image_targphys(machine->dtb, dtb_base, 
+                                       memmap[M1_MEM].size);
+        if (dtb_size < 0) {
+            error_report("Failed to load dtb from %s", machine->dtb);
+            exit(1);
+        }
+        printf("DTB loaded@%0lx size=%0x\n", dtb_base, dtb_size);
+        safe_ram_start += dtb_size;
+    }
+    
+    if (machine->initrd_filename) {
+        /* Align initrd to 64K like M1N1 does for some reason */
+        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 65536);
+        initrd_base = safe_ram_start;
+        printf("Found initrd: %s\n", machine->initrd_filename);
+        initrd_size = load_image_targphys(machine->initrd_filename, initrd_base,
+                                        memmap[M1_MEM].size);
+        if (initrd_size < 0) {
+            error_report("Failed to load initrd from %s", machine->initrd_filename);
+            exit(1);
+        }
+        printf("Initrd loaded@%0lx size=%0x\n", initrd_base, initrd_size);
+        safe_ram_start += initrd_size;
+    }
+    /* TODO: do this in a better way or not at all it's helpful for dev tho */
+    FILE *fconfig = fopen("boot_params.config", "w");
+    if (fconfig >= 0) {
+        if (kernel_base) {
+            fprintf(fconfig, "kernel\t0x%lx\t0x%x\n", kernel_base, kernel_size);
+        }
+        if (dtb_base) {
+            fprintf(fconfig, "dtb\t0x%lx\t0x%x\n", dtb_base, dtb_size);
+        }
+        if (initrd_base) {
+            fprintf(fconfig, "initrd\t0x%lx\t0x%x\n", initrd_base, initrd_size);
+        }
+        fclose(fconfig);
+    }
+    /* 
+     * NOTE: These come after because we need to know the size of the loaded
+     * data to safely load things
+     */
+    // Add apple flavored device tree
+    create_apple_dt(machine);
+    // Add boot args
+    create_boot_args(machine);
 }
 
 static void m1_mac_machine_init(MachineClass *mc)
 {
+    /* TODO: Clean this up a bit */
     mc->init = m1_mac_init;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
