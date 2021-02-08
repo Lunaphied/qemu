@@ -102,9 +102,26 @@ static hwaddr device_tree_end = 0;
 static hwaddr safe_ram_start = 0;
 
 /* Helper function to construct mp_affinity from cluster and core */
+/* TODO: I think core and cluster are only 8 bits, and there's another field
+ * above cluster maybe? */
 static inline uint32_t m1_mp_affinity(uint32_t cluster, uint32_t core)
 {
     return (cluster << 8) | (core & 0xFF);
+}
+
+/* Helper function to convert cpu_index to ARMCPU* pointer from complex */
+static ARMCPU* m1_get_cpu_by_index(AppleM1State *s, int cpu_index)
+{
+    if (cpu_index < APPLE_M1_TOTAL_CPUs) {
+        if (cpu_index >= APPLE_M1_ICESTORM_CPUS) {
+            /* Firestorm core */
+            return &s->firestorm_cores[cpu_index-APPLE_M1_ICESTORM_CPUS];
+        } else {
+            /* Icestorm core */
+            return &s->icestorm_cores[cpu_index];
+        }
+    }
+    return NULL;
 }
 
 /* 
@@ -126,18 +143,14 @@ static uint64_t m1_pmgr_read(void *opaque, hwaddr offset, unsigned size)
     {
         /* There's no specific offset for setting the reset vectors so stick them here */
         uint32_t cpuid = (offset - 0x10)/8;
-        uint32_t cluster = cpuid / 8;
-        uint32_t coreid = cpuid % 8;
-        if (cluster) {
-            /* Performance cores */
-            return s->firestorm_cores[coreid].rvbar;
-        } else {
-            /* Efficiency cores */
-            return s->icestorm_cores[coreid].rvbar;
-        }
+        assert(cpuid < APPLE_M1_TOTAL_CPUs);
+        uint64_t rvbar = m1_get_cpu_by_index(s, cpuid)->rvbar;
+        /* Access it little endian in 32-bit halves */
+        /* extract64 needed for 64-bit input but output value is truncted */
+        return extract64(rvbar, (offset & 4) ? 32 : 0, 32);
     }   
     default:
-        qemu_log("M1 PMGR: Unhandled read of @ %#lx\n", offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled read of @ %#lx\n", offset);
         break;
     }
     return 0;
@@ -153,7 +166,8 @@ static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned si
         /* M1N1 describes this as a system level startup bit we just ignore */
         break;
     case 0x8:
-        /* This is where we startup one of the efficiency cores */
+        /* TODO: combine the two */
+        /* This is where we startu  p one of the efficiency cores */
         //qemu_log("Efficiency core startup: %#x\n", value);
         for (int i = ctz32(value); i < APPLE_M1_ICESTORM_CPUS; i++) {
             if (value & (1<<i)) {
@@ -169,7 +183,7 @@ static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned si
         break;
     case 0xC:
         /* This is where we startup one of the performance cores */
-        //qemu_log("Performance core startup: %#x\n", value);
+        qemu_log("Performance core startup: %#x\n", value);
         for (int i = ctz32(value); i < APPLE_M1_FIRESTORM_CPUS; i++) {
             if (value & (1<<i)) {
                 ARMCPU *cpu = &s->firestorm_cores[i];
@@ -186,40 +200,15 @@ static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned si
     {
         /* There's no specific offset for setting the reset vectors so stick them here */
         uint32_t cpuid = (offset - 0x10)/8;
-        uint32_t cluster = cpuid / 4;
-        uint32_t coreid = cpuid % 4;
-        printf("Offset is %0lx, Size is %0x, val is %0lx\n", offset, size, val);
-        printf("coreid = %#x\n", coreid);
-        /* 
-         * FIXME:
-         * Apparently 64 bit accessed don't... actually work, handle split
-         * accesses
-         */
-        int half = ((offset - 0x10)/4) % 2;
-        printf("half = %#x\n", half);
-        uint64_t *p = NULL;
-        if (cluster) {
-            /* Performance cores */
-            p = &s->firestorm_cores[coreid].rvbar;
-        } else {
-            /* Efficiency cores */
-            p = &s->icestorm_cores[coreid].rvbar;
-        }
-        if (half) {
-            /* Handle writing the top half */
-            uint64_t new_val = *p & 0xFFFFFFFF;
-            new_val |= (val<<32);
-            *p = new_val;
-        } else {
-            /* Handle writing the bottom half */
-            uint64_t new_val = *p & (0xFFFFFFFFUL<<32);
-            new_val |= val;
-            *p = new_val;
-        }
+        assert(cpuid < APPLE_M1_TOTAL_CPUs);
+        ARMCPU *cpu = m1_get_cpu_by_index(s, cpuid);
+        /* Deposit only the bits being set since it's a 64-bit field with 32-bit
+         * access */
+        cpu->rvbar = deposit64(cpu->rvbar, (offset & 4) ? 32 : 0, 32, value);
         break;
     }
     default:
-        qemu_log("M1 PMGR: Unhandled write of %#x to %#lx\n", value, offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled write of %#x to %#lx\n", value, offset);
         break;
     }
 }
@@ -277,44 +266,90 @@ static void handle_m1_reset(void *opaque)
     cpu->env.cp15.hcr_el2 = 0x30488000000;
 }   
 
+/*
+ * TODO Cleanup and maybe move this to a device per core complex (linked to
+ * ARMCPU pointers stored in a top-level)
+ */
+static void m1_realize_cpu(ARMCPU *cpu, uint64_t mp_affinity, bool start_powered_off)
+{
+    Object *obj = OBJECT(cpu);
+    DeviceState *dev = DEVICE(cpu);
+    // TODO: Do we need to set CBAR?
+    /* Disable CPU */
+    qdev_prop_set_bit(dev, "start-powered-off", start_powered_off);
+    /* Set MPIDR */
+    qdev_prop_set_uint64(dev, "mp-affinity", mp_affinity);
+    /* Realize the CPU (defines IRQs) */
+    qdev_realize(dev, NULL, &error_abort);
+    
+    /* Connect a generic ARM timer to FIQ for the interrupts we need */
+    /* TODO: This OR IRQ ends up being more trouble than our own wrapper... */
+    DeviceState *fiq_or = qdev_new(TYPE_OR_IRQ);
+    object_property_add_child(obj, "fiq-or", OBJECT(fiq_or));
+    
+    /* NOTE: if you use less than 16 it can't store state properly */
+    qdev_prop_set_uint16(fiq_or, "num-lines", 16);
+    qdev_realize_and_unref(fiq_or, NULL, &error_fatal);
+    
+    /* Connect the output of the OR'd FIQ events to the FIQ input of the CPU */
+    qdev_connect_gpio_out(fiq_or, 0, qdev_get_gpio_in(dev, ARM_CPU_FIQ));
+    
+    /* Connect all the timer output pins from the core to the FIQ OR, not sure
+     * if this is true of hardware, fast IPIs also take this path
+     */
+    /* TODO: Is looping like this correct */
+    for (int i = 0; i < NUM_GTIMERS; i++) {
+        /* Connect output timer IRQ to input of the FIQ or */
+        qdev_connect_gpio_out(dev, i, qdev_get_gpio_in(fiq_or, i));
+    }
+}
+
 static void apple_m1_realize(DeviceState *dev, Error **errp)
 {
+    /* TODO: Cleanup needed before merge */
     AppleM1State *s = APPLE_M1(dev);
-    //Object *obj;
-    //MemoryRegion *system_mem = get_system_memory();
 
-    // Initialize all the cores
-    // TODO: Firestorm core 0 is the lucky one that gets to start powered up right now, however in actual hardware
-    //       all cores would have gone into a WFE type loop or setup waiting for an IPI and then WFI'd
-    // XXX: Comment above is wrong I think, it seems like actual hardware does a RISC-V like race through the same
-    //      code but one of them is specifically chosen and marked as such in the device tree and then the others
-    //      know to go into holding patterns? No clue, figure out later
+    /*
+     * NOTE: Initialization according to my understanding of hardware is as
+     * follows.
+     * 
+     * Default reset vectors (RVBAR) are at zero/rom, on boot, the first core
+     * is an Icestorm core (which is MPIDR 0 for Aff1 and Aff2), this might be
+     * something that boot rom sets up or it might be part of the hardware
+     * definition. Regardless, it ends up loading iBoot which completes loading
+     * the kernel eventually.
+     * 
+     * After startup the RVBARs are locked and the cores
+     * are no-longer able to have their reset vectors changed until some type
+     * of SoC-level reset occurs (unknown exactly what or if unlock is possible).
+     * 
+     * So Icestorm core 0 is the one that jumps into the kernel and allows the
+     * other cores to be started via the PMGR registers in the SoC.
+     */
+    /* TODO: QEMU has some built-in wrappers for clusters and core types
+     * those might be usable here to make this a bit cleaner so it can be
+     * a single loop (or we can just move the common initialization somewhere
+     * else and keep the two loops), having a single array of CPUs would be
+     * helpful in other places like the AIC code where we want to initialize
+     * a per-cpu state for each core and just need to iterate through the whole
+     * list (and we don't want to use QEMU's general list since I think it's
+     * good to not make QEMU rely on the assumption that CPUs will always be
+     * of the same type, at least not more than it does already)
+     */
     for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
-        // TODO: Somehow set the MP id's properly
-        // TODO: Do we need to set CBAR?
-        // TODO: How about RBAR? or whatever it is
-        // TODO: Interrupt mapping
-        // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
-        // Disable CPU 
-        object_property_set_bool(OBJECT(&s->firestorm_cores[i]), 
-                                 "start-powered-off", true, &error_abort);
-        // TODO: Better way?
-        qdev_prop_set_uint64(DEVICE(&s->firestorm_cores[i]), "mp-affinity", (0x101<<8)|i);
-        qdev_realize(DEVICE(&s->firestorm_cores[i]), NULL, &error_abort);
+        // TODO: Use wrapper that takes cluster and core id (I think the 0x101
+        // is actually 2 values, 0x1 and 0x1 again, differentiating cluster
+        // and something else)
+        /* All firestorms start off */
+        m1_realize_cpu(&s->firestorm_cores[i], (0x101UL<<8)|i, true);
     }
     // Now do the icestorm cores
     for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
-        // TODO: Somehow set the MP id's properly
-        // TODO: Do we need to set CBAR?
-        // TODO: How about RBAR? or whatever it is
-        // TODO: Interrupt mapping
-        // TODO: qdev_prop_set_xyz exists for everything except links so code seems to mix both?
-        // Disable CPU 
-        object_property_set_bool(OBJECT(&s->icestorm_cores[i]), 
-                                 "start-powered-off", i > 0, &error_abort);
-        // TODO: Better way?
-        qdev_prop_set_uint64(DEVICE(&s->icestorm_cores[i]), "mp-affinity", i);
-        qdev_realize(DEVICE(&s->icestorm_cores[i]), NULL, &error_abort);
+        // TODO: Use wrapper that takes cluster and core id (I think the 0x101
+        // is actually 2 values, 0x1 and 0x1 again, differentiating cluster
+        // and something else)
+        /* All except core 0 start off */
+        m1_realize_cpu(&s->icestorm_cores[i], i, i > 0);
     }
 
     // Framebuffer init
@@ -350,28 +385,6 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     // hardware this isn't a concern.
     // XXX: pending AIC
     //sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]), ARM_CPU_IRQ));
-
-    /* Connect a generic ARM timer to FIQ for the interrupts we need */
-    DeviceState *fiq_or = qdev_new(TYPE_OR_IRQ);
-    object_property_add_child(OBJECT(s), "fiq-or", OBJECT(fiq_or));
-    
-    /* NOTE: if you use less than 16 it can't store state properly */
-    qdev_prop_set_uint16(fiq_or, "num-lines", 16);
-    qdev_realize_and_unref(fiq_or, NULL, &error_fatal);
-    
-    // Connect the output to the FIQ input
-    qdev_connect_gpio_out(fiq_or, 0, 
-                          qdev_get_gpio_in(DEVICE(&s->icestorm_cores[0]),
-                                           ARM_CPU_FIQ));
-    // Connect all of the timers as potential FIQ inputs fr good measure
-    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_PHYS,
-                          qdev_get_gpio_in(fiq_or, 0));
-    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_VIRT,
-                          qdev_get_gpio_in(fiq_or, 1));
-    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_HYP,
-                          qdev_get_gpio_in(fiq_or, 2));
-    qdev_connect_gpio_out(DEVICE(&s->icestorm_cores[0]), GTIMER_SEC,
-                          qdev_get_gpio_in(fiq_or, 3));
     
     sysbus_realize(SYS_BUS_DEVICE(&s->aic), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->aic), 0, memmap[M1_AIC].base);
@@ -654,6 +667,9 @@ static void m1_mac_init(MachineState *machine)
     hwaddr initrd_base = 0;
     int initrd_size = 0;
     
+    /* TODO move these to specific helper functions, model after ppc/riscv boot
+     * helper code which *does* work well with platforms that don't want to
+     * have reset handled (unlike the ARM booter functions) */
     if (machine->firmware) {
         /* Align firmware to a 4K page */
         safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 4096);

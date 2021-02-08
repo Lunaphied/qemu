@@ -15,8 +15,10 @@
 #include "hw/intc/apple-aic.h"
 
 // The M1 has a fixed number of cores, model that
+/* TODO: This seems more messy as time goes on... */
 #define APPLE_M1_FIRESTORM_CPUS 4
-#define APPLE_M1_ICESTORM_CPUS 4
+#define APPLE_M1_ICESTORM_CPUS  4
+#define APPLE_M1_TOTAL_CPUs     8
 
 // Renamed to just apple-m1 since that seems to be the SoC name
 #define TYPE_APPLE_M1 "apple-m1"
