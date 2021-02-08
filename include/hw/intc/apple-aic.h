@@ -25,12 +25,12 @@
 #include "hw/sysbus.h"
 
 /*
- * This is defined because if we ever try to use more than
- * this number of CPUs the AIC code isn't designed to handle
- * it and it won't work (CPU distribution uses 32bit sized
- * bitmaps
+ * The AIC uses a 32-bit field for it's distribution bitmap so only 31 output
+ * IRQs at a time can ever exist, furthermore the IPI_FLAG (stored as ipi_pending)
+ * reserves the top bit for "self" IPI which triggers this core with an IPI that
+ * has a different result from reading the IRQ_REASON register.
  */
-#define AIC_MAX_CPUS 32
+#define AIC_MAX_CPUS 31
 
 /* TODO: Find out real address space of AIC */
 #define AIC_MMIO_SIZE 0x10000

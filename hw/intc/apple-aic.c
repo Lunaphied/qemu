@@ -113,9 +113,16 @@
 #define AIC_TIMER_LOW       0x8020
 #define AIC_TIMER_HIGH      0x8028
 
-/* IRQ reasons (reported by reason register) */
+/* IRQ event types (reported by reason register) */
+/* TODO: Rename to include event */
 #define AIC_IRQ_HW  (1<<0)
 #define AIC_IRQ_IPI (1<<2)
+
+/* IPI types (used in-place of IRQ # when reason is read) */
+/* TODO rename as part of above */
+#define AIC_IPI_TYPE_OTHER 1
+#define AIC_IPI_TYPE_SELF  2
+
 /* TODO: Masks and shifts for IRQ reason */
 
 /* HACK: bad bad bad */
@@ -145,7 +152,12 @@
  * TODO: find out how linux maps IPI/dist masks to CPU numbers
  *       might just be based on the info from the device tree
  */
-static uint32_t current_reason = 0;
+/* HACK update: Slightly improved, but it's based on current_cpu which
+ * relies on only ever having ARM_CPU compatible CPUs emulated and also
+ * is probably unreliable in general (the same hack is currently used for
+ * timers until both issues get fixed)
+ */
+static uint32_t current_reason[AIC_MAX_CPUS] = {0,};
 
 /* Helpers to avoid mystery constants */
 #define AIC_INVALID_IRQ (-1)
@@ -338,11 +350,14 @@ static void aic_update_irq(AppleAICState *s)
          */
         if (result_lines & (1<<i)) {
             /* HACK */
-            current_reason = (AIC_IRQ_HW<<16)|result_irqs[i];
+            current_reason[i] = (AIC_IRQ_HW<<16)|result_irqs[i];
             aic_set_irq(s, i, AIC_IRQ_HIGH);
         } else if (valid_ipis & (1<<i)) {
             /* HACK */
-            current_reason = (AIC_IRQ_IPI<<16);
+            /* Since we don't actually implement self IPI's yet always use
+             * "other" as the type
+             */
+            current_reason[i] = (AIC_IRQ_IPI<<16)|AIC_IPI_TYPE_OTHER;
             //printf("Raising IPI for CPU@%0x\n",i);
             aic_set_irq(s, i, AIC_IRQ_HIGH);
         } else {
@@ -356,6 +371,7 @@ static void aic_update_irq(AppleAICState *s)
 static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleAICState *s = APPLE_AIC(opaque);
+    ARMCPU *cpu = ARM_CPU(current_cpu);
     switch (offset) {
     case AIC_INFO: /* AIC_INFO */
         return AIC_NUM_IRQ;
@@ -367,13 +383,20 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* Reading this also handles acking an IRQ (and masking it) */
         /* TODO: move this to handler it's too big for the switch */
         /* Must have a current reason to decode */
-        if (current_reason != 0) {
-            uint32_t reason_type = current_reason >> 16;
-            uint32_t reason_irq = current_reason & 0xFFFF;
+        int cpu_index = cpu->mp_affinity & 0xFF;
+        /* TODO clean this mess up */
+        if ((cpu->mp_affinity >> 8) == 0x101) {
+            /* Firestorm core offset */
+            cpu_index += 4;
+        }
+        uint32_t reason = current_reason[cpu_index];
+        if (reason != 0) {
+            uint32_t reason_type = reason >> 16;
+            uint32_t reason_irq = reason & 0xFFFF;
             //printf("Got reason of type=%0x, irq=%0x\n", reason_type, reason_irq);
             switch (reason_type) {
                 case AIC_IRQ_IPI:
-                    s->ipi_mask |= ~0;
+                    s->ipi_mask |= (1U)<<cpu_index;
                     break;
                 case AIC_IRQ_HW:
                     aic_set_bit(reason_irq, s->irq_mask);
@@ -411,8 +434,7 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
          * up incoming IRQ events. The latter makes little sense to me
          * at the moment but it's possible so noting it here.
          */
-        uint32_t old_reason = current_reason;
-        current_reason = 0;
+        current_reason[cpu_index] = 0;
         /* 
          * TODO: make this not sound like nonsense
          * NOTE: update must occur after we clear the reason
@@ -420,7 +442,7 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
          * masked the IRQ we have just asked by reading the reason
          */
         aic_update_irq(s);
-        return old_reason;
+        return reason;
     }
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
         return s->irq_dist[offset - AIC_DIST];
@@ -447,10 +469,10 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         return *aic_offset_ptr(offset, AIC_HW_STATE, s->irq_pending);
     case AIC_TIMER_LOW: /* Lower 32 bits of the CNTPCT_EL0 timer */
         /* TODO: this is bad and broken, we need per-cpu state to do this */
-        return aic_emulate_timer(ARM_CPU(current_cpu)) & 0xFFFFFFFF;
+        return aic_emulate_timer(cpu) & 0xFFFFFFFF;
     case AIC_TIMER_HIGH: /* Upper 32 bits of the CNTPCT_EL0 timer */
         /* TODO: this is bad and broken, we need per-cpu state to do this */
-        return (aic_emulate_timer(ARM_CPU(current_cpu)) >> 32) & 0xFFFFFFFF;
+        return (aic_emulate_timer(cpu) >> 32) & 0xFFFFFFFF;
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
