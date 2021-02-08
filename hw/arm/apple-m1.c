@@ -392,9 +392,11 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     /* TODO: CPU order (at least for linux is 0-4 icestorm, 0-4 firestorm
      *       we will want to connect all of them as CPUs 0-8
      */
-    sysbus_connect_irq(SYS_BUS_DEVICE(&s->aic), 0,
-                       qdev_get_gpio_in(DEVICE(&s->firestorm_cores[0]),
-                                        ARM_CPU_IRQ));
+    for (int i = 0; i < APPLE_M1_TOTAL_CPUs; i++) {
+        dev = DEVICE(m1_get_cpu_by_index(s, i));
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->aic), i,
+                           qdev_get_gpio_in(dev, ARM_CPU_IRQ));  
+    }
     /* Connect UART to AIC */
     /* FIXME: connect to every IRQ bc something weird with linux */
     /*
