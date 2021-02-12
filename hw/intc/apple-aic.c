@@ -31,8 +31,8 @@
  * 
  * 0x2000            - Current CPU id?
  * 0x2004            - IRQ reason
- * 0x2008            - IPI flag set
- * 0x200C            - IPI flag clear
+ * 0x2008            - IPI send
+ * 0x200C            - IPI ack
  * 0x2024            - IPI mask set
  * 0x2028            - IPI mask clear
  * 
@@ -53,7 +53,8 @@
 
 #include "qemu/osdep.h"
 #include "hw/irq.h"
-#include "hw/core/cpu.h" /* HACK this is only here for getting current core */
+/* HACK this is only here for getting current core */
+#include "hw/core/cpu.h" 
 #include "cpu.h"
 #include "qemu/timer.h"
 #include "hw/intc/apple-aic.h"
@@ -62,22 +63,18 @@
 
 /* TODO: Move register defs to seperate header */
 #define AIC_INFO         0x0004
-#define AIC_CURRENT_CORE 0x2000
-#define AIC_IRQ_REASON   0x2004
 
 /* HW to CPU distribution map */
 #define AIC_DIST         0x3000
 #define AIC_DIST_SIZE    (AIC_NUM_IRQ*4)
 #define AIC_DIST_END     (AIC_DIST+AIC_DIST_SIZE-1)
 
-/* All the HW IRQ ranges are this big */
-/* FIXME: Technically this should be AIC_NUM_IRQ/32 */
-/* TODO: Name is awkward */
-#define AIC_IRQ_REG_SIZE    0x0080
+/* Packed IRQ bitmaps have this number of bytes */
+#define AIC_IRQ_REG_SIZE ((AIC_NUM_IRQ*4)/32)
 
 /* SW initiated HW IRQs */
 #define AIC_SW_SET       0x4000
-#define AIC_SW_SET_END   (AIC_SW_SET+AIC_IRQ_REG_SIZE-1)
+#define AIC_SW_SET_END   (AIC_SW_SET+AIC_IRQ_REG_COUNT-1)
 #define AIC_SW_CLEAR     0x4080
 #define AIC_SW_CLEAR_END (AIC_SW_CLEAR+AIC_IRQ_REG_SIZE-1)
 
@@ -93,23 +90,19 @@
 #define AIC_HW_STATE        0x4200
 #define AIC_HW_STATE_END    (AIC_HW_STATE+AIC_IRQ_REG_SIZE-1)
 
-/* TODO: Understand IPIs better, the linux driver implies features
- * that aren't exposed in the actual driver or the Github wiki page
- * entry, but doesn't use them either so there's no clarity of how
- * the self/other IPI is distinguished when there's only one mask
- * there's also defines for a register out at 0x5000 that seem to
- * let you set IPIs as well? Is that the other IPI functionality?
- */
+/* Per-core cpu region stuff */
+#define AIC_CURRENT_CORE 0x2000
+#define AIC_IRQ_REASON   0x2004
 
-/* IPI flag set and clear (sends the IPI) */
-#define AIC_IPI_FLAG_SET    0x2008
-#define AIC_IPI_FLAG_CLEAR  0x200C
+/* IPI send and ack are almost like set/clear for IPI but not quite */
+#define AIC_IPI_SEND    0x2008
+#define AIC_IPI_ACK     0x200c
 
 /* IPI mask */
 #define AIC_IPI_MASK_SET    0x2024
 #define AIC_IPI_MASK_CLEAR  0x2028
 
-/* Timer passthrough */
+/* Timer passthrough (TODO this probably isn't actually passthrough) */
 #define AIC_TIMER_LOW       0x8020
 #define AIC_TIMER_HIGH      0x8028
 
@@ -122,6 +115,11 @@
 /* TODO rename as part of above */
 #define AIC_IPI_TYPE_OTHER 1
 #define AIC_IPI_TYPE_SELF  2
+
+/* IPI bit positions */
+/* TODO Rename */
+#define AIC_IPI_BIT_OTHER   BIT(31)
+#define AIC_IPI_BIT_SELF    BIT(0)
 
 /* TODO: Masks and shifts for IRQ reason */
 
@@ -198,16 +196,17 @@ static inline void aic_set_irq(AppleAICState *s, int cpu, int level)
     if (cpu > AIC_MAX_CPUS) {
         return;
     }
-    uint32_t masked = s->irq_out_status & AIC_BIT_MASK(cpu);
-    if (level && !masked) {
-        /* IRQ just was raised so trigger an output IRQ change */
-        s->irq_out_status |= AIC_BIT_MASK(cpu);
-        //printf("Raising IRQ for CPU@%d\n", cpu);
-        qemu_irq_raise(s->irq_out[cpu]);
-    } else if (!level && masked) {
-        /* IRQ just was lowered so trigger an output IRQ change */
-        s->irq_out_status &= ~AIC_BIT_MASK(cpu);
-        qemu_irq_lower(s->irq_out[cpu]);
+    /* TODO Assert that level is 1 or 0? */
+    
+    /* Determine if level has changed and update with new value */
+    int last_level = s->core_state[cpu].irq_status;
+    int changed = last_level != level;
+    s->core_state[cpu].irq_status = level;
+    
+    /* If the value has changed we propegate to the IRQ handlers */
+    if (changed) {
+        /* TODO: Add tracing */
+        qemu_set_irq(s->core_state[cpu].irq, level);
     }
 }
 /* 
@@ -261,8 +260,6 @@ static void aic_update_irq(AppleAICState *s)
      * than the last state of that line, we raise or lower that line
      */
     uint32_t result_lines = 0;
-    /* HACK need to store as part of per-cpu data */
-    uint32_t result_irqs[AIC_MAX_CPUS] = { 0, };
     
     /* Update the IRQ lines */
     for (int i = 0; i < AIC_IRQ_REG_COUNT; i++) {
@@ -317,9 +314,10 @@ static void aic_update_irq(AppleAICState *s)
                             continue;
                         }
                         /* Store the IRQ number that is responsible
-                         * for raising the line
+                         * for raising the line, just store directly
+                         * in reason.
                          */
-                        result_irqs[k] = irq_base+j;
+                        s->core_state[k].irq_reason = irq_base+j;
                     }
                 }
             }
@@ -330,18 +328,10 @@ static void aic_update_irq(AppleAICState *s)
          * not being used by CPUs)
          */
     }
+    /* TODO Remove for merge */
     if (result_lines != 0) {
         //printf("AIC: Computed IRQs after search: %0x\n", result_lines);
     }
-    
-    /* 
-     * Now compute IPIs which are simply the IPI pending after masking
-     * TODO: This actually only computes IPIs using the "other" mode
-     * where we use the aliased IPI register to poke a bit that indicates
-     * to set the IPI on the specific processor, kinda strange to
-     * distinguish self vs. other, I wonder how OS X is coded
-     */
-    uint32_t valid_ipis = s->ipi_pending & ~s->ipi_mask;
     
     /* This can't really be faster since we need to apply every bit */
     for (int i = 0; i < s->num_cpu; i++) {
@@ -349,101 +339,178 @@ static void aic_update_irq(AppleAICState *s)
          * hw IRQs first
          */
         if (result_lines & (1<<i)) {
-            /* HACK */
-            current_reason[i] = (AIC_IRQ_HW<<16)|result_irqs[i];
-            aic_set_irq(s, i, AIC_IRQ_HIGH);
-        } else if (valid_ipis & (1<<i)) {
-            /* HACK */
-            /* Since we don't actually implement self IPI's yet always use
-             * "other" as the type
-             */
-            current_reason[i] = (AIC_IRQ_IPI<<16)|AIC_IPI_TYPE_OTHER;
-            //printf("Raising IPI for CPU@%0x\n",i);
+            /* Add in the IRQ_HW type since we know it's hardware now */
+            s->core_state[i].irq_reason |= AIC_IRQ_HW<<16;
             aic_set_irq(s, i, AIC_IRQ_HIGH);
         } else {
-            /* Nothing is raising the IRQ line */
-            aic_set_irq(s, i, AIC_IRQ_LOW);
+            /* 
+            * IPIs are computed here since IPIs can obviously be sent
+            * to each CPU individually, the only two bits that matter are
+            * the top bit (bit 31) which is for "OTHER" type IPIs and the
+            * bottom bit (bit 0) which is used for "SELF" type IPIs.
+            * 
+            * NOTE: we assume HW IRQs preempt IPIs at the moment.
+            * an important aspect of this is that writes to trigger other
+            * set a bit representing the CPU index to trigger, but the
+            * only state that results is a single "OTHER" bit being set
+            * meaning that only one OTHER IPI can be in flight at a time.
+            * 
+            * At least as we implement it. It's possible the hardware records
+            * senders and keeps the other bit set until an ACK for each
+            * trigger is sent but that seems rather unlikely and isn't
+            * a terribly hard change should it be true.
+            */
+            uint32_t valid_ipis = s->core_state[i].ipi_pending & 
+                                  ~s->core_state[i].ipi_mask;
+            if (valid_ipis) {
+                /* This sets the type and clears the HW IRQ */
+                s->core_state[i].irq_reason = (AIC_IRQ_IPI<<16);
+                /* Right now other IPIs pre-empt self IPIs */
+                if (valid_ipis & AIC_IPI_BIT_OTHER) {
+                    current_reason[i] |= AIC_IPI_TYPE_OTHER;
+                } else if (valid_ipis & AIC_IPI_BIT_SELF) {
+                    current_reason[i] |= AIC_IPI_TYPE_SELF;
+                } else {
+                    /* TODO: Replace this with proper assert */
+                    error_report("Invalid IPI set 0x%x", valid_ipis);
+                    abort();
+                }
+                /* Now we have to raise the IRQ line for this processor */
+                aic_set_irq(s, i, AIC_IRQ_HIGH);
+            }  else {
+                /* TODO: move this out of nesting */
+                /* Nothing is raising the IRQ line */
+                /* Clear reason */
+                s->core_state[i].irq_reason = 0;
+                /* Set the line low */
+                aic_set_irq(s, i, AIC_IRQ_LOW);
+            }
         }
     }
+}
+
+/* 
+ * This is marked as read because that's what it handles, but it
+ * really processes an "update" since reads modify state
+ */
+static uint32_t aic_read_reason(AppleAICState *s, int cpu_index) {
+    /* TODO Clean up */
+    if (cpu_index > AIC_MAX_CPUS) {
+        error_report("CPU calling us had an index of 0x%x which was too high",
+                     cpu_index);
+        abort();
+    }
+    
+    /* Get the current reason */
+    uint32_t reason = s->core_state[cpu_index].irq_reason;
+    
+    if (!reason) {
+        /* 
+         * If nothing is pending this is unspecified but just return 0
+         * and skip processing.
+         * 
+         * (NOTE linux driver actually seems to assume that returning 0
+         * is a valid way to indiciate no more IRQs pending so maybe it's
+         * not unspecified)
+         */
+        return 0;
+    }
+    
+    /* TODO: Use defines for this */
+    /*
+     * Now we have to mask the reason since the IRQ handler has now processed
+     * this IRQ event and must tell the AIC it's ready to process another
+     */
+    uint32_t reason_type = reason >> 16;
+    uint32_t reason_irq = reason & 0xFFFF;
+    if (reason_type == AIC_IRQ_HW) {
+        /* Mask the provided IRQ number */
+        aic_set_bit(reason_irq, s->irq_mask);
+    } else {
+        /* Mask the specified IPI (both types are local masks) */
+        if (reason_irq == AIC_IPI_TYPE_OTHER) {
+            s->core_state[cpu_index].ipi_mask |= AIC_IPI_BIT_OTHER;
+        } else if (reason_irq == AIC_IPI_TYPE_SELF) {
+            s->core_state[cpu_index].ipi_mask |= AIC_IPI_BIT_SELF;
+        } else {
+            /* TODO: Real assert */
+            error_report("Invalid IPI reason (check aic_update_irq): 0x%x",
+                         reason_irq);
+            abort();
+        }
+    }
+    /* Trigger an update in case a new IRQ is triggered here (updates reason) */
+    aic_update_irq(s);
+    
+    /* Return the original reason, next pass will get new reason */
+    return reason;
+}
+
+/* 
+ * Handles converting the incoming IPI bit to a set bit in the 
+ * per CPU structure
+ * We pass in caller CPU index because self IPIs use that
+ */
+static void aic_send_ipi(AppleAICState *s, int cpu, uint32_t value) {
+    /* Loop through looking for set IPI bits */
+    for (int i = clz32(value); i < AIC_MAX_CPUS; i++) {
+        if (value & (1<<i)) {
+            /* This will set a pending other IPI */
+            s->core_state[i].ipi_pending |= AIC_IPI_BIT_OTHER;
+        }
+    }
+    if (value & AIC_IPI_BIT_SELF) {
+        /* This sets a pending self IPI */
+        s->core_state[cpu].ipi_pending |= AIC_IPI_BIT_SELF;
+    }
+    
+    /* 
+     * TODO is there any performance gains we can get by not scanning the
+     * whole set every time we update IPIs or a single IRQ?
+     */
+    /* Handle the update locally */
+    aic_update_irq(s);
+}
+
+/* 
+ * FIXME This whole concept is broken by design, we need to use aliases
+ * and per-cpu memory regions that handle the dispatch for us properly
+ * for now we want things to work so use this (other code uses this too)
+ * and for us this is the cleanest structure without overcomplicating the
+ * SoC side of things.
+ * 
+ * This method should be only used in the read/write mem methods since
+ * everything else should have this detail abstracted out as a parameter
+ * for when the proper code is written.
+ */
+static CPUState* get_current_cpu() {
+    /* FIXME this is broken by design */
+    CPUState *cpu = CPU(current_cpu);
+    return cpu;
 }
 
 /* TODO MMIO for real, each type of IO region should probably be split */
 static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleAICState *s = APPLE_AIC(opaque);
-    ARMCPU *cpu = ARM_CPU(current_cpu);
+    /* FIXME: read method FIXME */
+    CPUState *cpu = get_current_cpu();
+    /* 
+     * FIXME also broken since this depends on initialization order and
+     * isn't set specifically, would be nice to know preferred patterns
+     * (i.e. should this be set manually then used? Is it internal?
+     * who knows!)
+     */
+    int cpu_index = cpu->cpu_index;
     switch (offset) {
     case AIC_INFO: /* AIC_INFO */
         return AIC_NUM_IRQ;
     case AIC_CURRENT_CORE: /* AIC_CURRENT_CORE */
-        /* TODO: Link the CPUs back here so we can return who we are? */
-        return 0;
+        /* TODO: Where is this value defined? */
+        /* HACK */
+        return cpu_index;
     case AIC_IRQ_REASON: /* AIC_IRQ_REASON */
-    {
-        /* Reading this also handles acking an IRQ (and masking it) */
-        /* TODO: move this to handler it's too big for the switch */
-        /* Must have a current reason to decode */
-        int cpu_index = cpu->mp_affinity & 0xFF;
-        /* TODO clean this mess up */
-        if ((cpu->mp_affinity >> 8) == 0x101) {
-            /* Firestorm core offset */
-            cpu_index += 4;
-        }
-        uint32_t reason = current_reason[cpu_index];
-        if (reason != 0) {
-            uint32_t reason_type = reason >> 16;
-            uint32_t reason_irq = reason & 0xFFFF;
-            //printf("Got reason of type=%0x, irq=%0x\n", reason_type, reason_irq);
-            switch (reason_type) {
-                case AIC_IRQ_IPI:
-                    s->ipi_mask |= (1U)<<cpu_index;
-                    break;
-                case AIC_IRQ_HW:
-                    aic_set_bit(reason_irq, s->irq_mask);
-                    break;
-            }
-        }
-        /* TODO: Should we do an AIC update IRQ here since IRQ
-         * was acked?*/
-        /* NOTE: probably yes, since multiple IRQs could theoretically
-         * be queued at once on hardware there could be multiple valid
-         * IRQs occuring with unique event codes, reading it again
-         * would get the next highest priority event. On QEMU everything
-         * is synchronous (at least for now?) such that no code gets 
-         * to set IRQs simultaneously with other code (and even if it did)
-         * there would probably be a total order? (this is probably
-         * nonsense whatever).
-         * 
-         * The result is it simply probably doesn't matter on qemu except 
-         * in the case that there was an existing IRQ, we reenabled IRQs
-         * to allow ourselves to be preempted by a higher priority IRQ
-         * and then the hardware sends us another IRQ and we want to
-         * go handle that. I'm fairly sure Linux might actually do this
-         * but we need to understand what the real AIC does in that case
-         * to understand what makes sense to implement here. For now
-         * we don't support the reason being decoupled
-         */
-        /*
-         * Above comment is old and I didn't read it to change it properly
-         * we call IRQ update after this beacuse after a higher priority
-         * IRQ is acked (reason is read) the existing IRQ is acked and then
-         * the next read will return the next set IRQ if IRQs are still
-         * pending. 
-         * NOTE: we assume here that hardware dynamically generates reason
-         * from the highest priority unmasked IRQ rather than say queuing
-         * up incoming IRQ events. The latter makes little sense to me
-         * at the moment but it's possible so noting it here.
-         */
-        current_reason[cpu_index] = 0;
-        /* 
-         * TODO: make this not sound like nonsense
-         * NOTE: update must occur after we clear the reason
-         * since it will update it given that we have now
-         * masked the IRQ we have just asked by reading the reason
-         */
-        aic_update_irq(s);
-        return reason;
-    }
+        return aic_read_reason(s, cpu_index);
     case AIC_DIST ... AIC_DIST_END: /* AIC_DIST */
         return s->irq_dist[offset - AIC_DIST];
     case AIC_SW_SET ... AIC_SW_SET_END: /* AIC_SW_SET */
@@ -454,12 +521,13 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         return *aic_offset_ptr(offset, AIC_MASK_SET, s->irq_mask);
     case AIC_MASK_CLEAR ... AIC_MASK_CLEAR_END: /* AIC_MASK_CLEAR */
         return *aic_offset_ptr(offset, AIC_MASK_CLEAR, s->irq_mask);
-    case AIC_IPI_FLAG_SET:      /* AIC_IPI_FLAG_SET */
-    case AIC_IPI_FLAG_CLEAR:    /* AIC_IPI_FLAG_CLEAR */
-        return s->ipi_pending;
+    case AIC_IPI_SEND:      /* AIC_IPI_FLAG_SET */
+    case AIC_IPI_ACK:       /* AIC_IPI_FLAG_CLEAR */
+        /* TODO: know if reading ACK actually returns this */
+        return s->core_state[cpu_index].ipi_pending;
     case AIC_IPI_MASK_SET:      /* AIC_IPI_MASK_SET */
     case AIC_IPI_MASK_CLEAR:    /* AIC_IPI_MASK_CLEAR */
-        return s->ipi_mask;
+        return s->core_state[cpu_index].ipi_mask;
     case AIC_HW_STATE ... AIC_HW_STATE_END: /* State of input HW lines */
         /* Get the current pending value which is what I think this
          * does on hardware
@@ -469,10 +537,10 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         return *aic_offset_ptr(offset, AIC_HW_STATE, s->irq_pending);
     case AIC_TIMER_LOW: /* Lower 32 bits of the CNTPCT_EL0 timer */
         /* TODO: this is bad and broken, we need per-cpu state to do this */
-        return aic_emulate_timer(cpu) & 0xFFFFFFFF;
+        return aic_emulate_timer(ARM_CPU(cpu)) & 0xFFFFFFFF;
     case AIC_TIMER_HIGH: /* Upper 32 bits of the CNTPCT_EL0 timer */
         /* TODO: this is bad and broken, we need per-cpu state to do this */
-        return (aic_emulate_timer(cpu) >> 32) & 0xFFFFFFFF;
+        return (aic_emulate_timer(ARM_CPU(cpu)) >> 32) & 0xFFFFFFFF;
     default:
         printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
                offset, size);
@@ -484,6 +552,16 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
                          unsigned size)
 {
     AppleAICState *s = APPLE_AIC(opaque);
+    /* FIXME: read method FIXME */
+    CPUState *cpu = get_current_cpu();
+    /* 
+     * FIXME also broken since this depends on initialization order and
+     * isn't set specifically, would be nice to know preferred patterns
+     * (i.e. should this be set manually then used? Is it internal?
+     * who knows!)
+     */
+    int cpu_index = cpu->cpu_index;
+    
     uint32_t value = val;
     bool changed = false;
     switch (offset) {
@@ -516,23 +594,21 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
             aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_MASK_CLEAR));
         }
         break;
-    case AIC_IPI_FLAG_SET:
-        s->ipi_pending |= value;
-        // TODO: only handle changes/IPIs
-        aic_update_irq(s);
+    case AIC_IPI_SEND:
+        aic_send_ipi(s, cpu_index, value);
         break;
-    case AIC_IPI_FLAG_CLEAR:
-        s->ipi_pending &= ~value;
+    case AIC_IPI_ACK:
+        s->core_state[cpu_index].ipi_pending &= ~value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
     case AIC_IPI_MASK_SET: 
-        s->ipi_mask |= value;
+        s->core_state[cpu_index].ipi_mask |= value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
     case AIC_IPI_MASK_CLEAR:
-        s->ipi_mask &= ~value;
+        s->core_state[cpu_index].ipi_mask |= ~value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
@@ -587,28 +663,27 @@ static void apple_aic_realize(DeviceState *dev, Error **errp)
      * generated code even if it is less generic
      */
     aic_zero_bits(s->sw_pending, AIC_NUM_IRQ);
-    
     aic_zero_bits(s->irq_pending, AIC_NUM_IRQ);
     aic_fill_bits(s->irq_mask, AIC_NUM_IRQ);
     
-    /* NOTE: IPIs are capped to at most having 32 CPUs
-     * accessed by a single AIC */
-    s->ipi_pending = 0;
-    s->ipi_mask = ~0;
+    /* Use memset to clear all the per-CPU data */
+    /* TODO: Allocate dynamically? */
+    memset(&s->core_state, 0, sizeof(s->core_state));
+    for (int i = 0; i < s->num_cpu; i++) {
+        s->core_state[i].ipi_mask = ~0U;
+    }
     
-    /* We start will all lines low */
-    s->irq_out_status = 0;
+    memory_region_init_io(&s->mmio_mr, OBJECT(s), &aic_io_ops, s, "aic-mmio",
+                          AIC_MMIO_SIZE);
     
-    memory_region_init_io(&s->mmio_region, OBJECT(s), &aic_io_ops, s,
-                          "aic-mmio", AIC_MMIO_SIZE);
     /* Init input HW interrupts */
     qdev_init_gpio_in(dev, aic_irq_handler, s->num_irq);
     
     SysBusDevice *busdev = SYS_BUS_DEVICE(s);
-    sysbus_init_mmio(busdev, &s->mmio_region);
+    sysbus_init_mmio(busdev, &s->mmio_mr);
     
     for (int i = 0; i < s->num_cpu; i++) {
-        sysbus_init_irq(busdev, &s->irq_out[i]);
+        sysbus_init_irq(busdev, &s->core_state[i].irq);
     }
 }
 

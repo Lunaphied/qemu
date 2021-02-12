@@ -7,7 +7,6 @@
  */
 
 /*
- * FIXME: Currently CPU 
  * QEMU interface:
  *   + unnamed GPIO inputs: 0..AIC_NUM_IRQ
  *   + sysbus IRQs:
@@ -15,7 +14,19 @@
  *     - IRQ for CPU 1
  *     - ...
  *   + sysbus MMIO regions: 
- *     - general AIC_MMIO_SIZE region, handles non-specific data
+ *     0 - general AIC_MMIO_SIZE region, connect to sysbus
+ * 
+ * QOM properties:
+ *   + "soc" - Link back to the parent SoC
+ * Note that 
+ * Intended use is for users of this device to map the general memory region
+ * at the base address for the AIC, then overlap map specific CPU interface
+ * offsets. The reason we overlap map the other regions on top is that the
+ * common mapped region is embedded inside the memory map of the overall
+ * AIC and splitting it into multiple regions isn't ideal.
+ * 
+ * apple-m1.c has an example of this usage.
+ * 
  * See the .c file for more info about the MMIO space layout
  */
 
@@ -23,6 +34,7 @@
 #define HW_INTC_APPLE_AIC_H
 
 #include "hw/sysbus.h"
+#include "apple_aic_bitmap.h"
 
 /*
  * The AIC uses a 32-bit field for it's distribution bitmap so only 31 output
@@ -34,6 +46,7 @@
 
 /* TODO: Find out real address space of AIC */
 #define AIC_MMIO_SIZE 0x10000
+
 /* TODO: Find out the real per-cpu address space size */
 #define AIC_PER_CPU_MMIO_SIZE 0x4
 
@@ -44,195 +57,97 @@
 #define AIC_NUM_IRQ 896
 #define AIC_NUM_IPI 2
 
-/*
- * Mini local version of the bitmap/bitop functions working in 32-bit
- * values to match the hardware. Other code in QEMU does similar and
- * the way the bitmap API works should probably be changes to handle
- * this problem
- * TODO: move the seperate header
- */
-
 /* 
  * This is the number of vaild uint32_t entries in the irq map
  */
 #define AIC_IRQ_REG_COUNT DIV_ROUND_UP(AIC_NUM_IRQ, 32)
 
-/*
- * nbits must be a compile time constant
- */
-#define AIC_DECLARE_BITMAP(name, nbits) \
-    uint32_t name[DIV_ROUND_UP(nbits, 32)]
-
-#define AIC_BIT_MASK(nr) (1U << ((nr) % 32))
-#define AIC_BIT_WORD(nr) ((nr) / 32)
-
-/*
- * Converts an offset value in the MMIO to an index in the
- * array
- */
-static inline uint32_t aic_offset_to_reg(hwaddr offset, hwaddr base)
-{
-    return (offset-base)/4;
-}
-
-/*
- * Returns a pointer accessing the 32-bit word containing
- * the specified bit
- */
-static inline uint32_t* aic_bit_ptr(int nr, uint32_t *addr)
-{
-    return addr + AIC_BIT_WORD(nr);
-}
-
-/*
- * Returns a pointer accessing the 32-bit word containing
- * the specified register, this is intended as a helper function
- * for the reader/writer MMIO handlers
- */
-static inline uint32_t* aic_offset_ptr(hwaddr offset, hwaddr base,
-                                       uint32_t *addr)
-{
-    return addr + aic_offset_to_reg(offset, base);
-}
-
-/*
- * Helper to update a register, returns true of there was a change
- * in value, this is helpful since it tells the accessers when to
- * update the IRQ status
- */
-static inline bool aic_update_reg(hwaddr offset, hwaddr base, uint32_t *addr,
-                                  uint32_t value)
-{
-    uint32_t *p = aic_offset_ptr(offset, base, addr);
-    if (*p != value) {
-        *p = value;
-        return true;
-    }
-    return false;
-}
-
-/*
- * Helper to update a register by setting bits, returns true if a change
- * occured
- */
-static inline bool aic_set_reg(hwaddr offset, hwaddr base, uint32_t *addr,
-                               uint32_t value)
-{
-    uint32_t *p = aic_offset_ptr(offset, base, addr);
-    uint32_t old_value = *p;
-    uint32_t new_value = old_value | value;
-    if (old_value != new_value) {
-        *p = new_value;
-        return true;
-    }
-    return false;
-}
-
-/*
- * Helper to update a register by setting bits, returns true if a change
- * occured
- */
-static inline bool aic_clear_reg(hwaddr offset, hwaddr base, uint32_t *addr,
-                               uint32_t value)
-{
-    uint32_t *p = aic_offset_ptr(offset, base, addr);
-    uint32_t old_value = *p;
-    uint32_t new_value = old_value & ~value;
-    if (old_value != new_value) {
-        *p = new_value;
-        return true;
-    }
-    return false;
-}
-
-/*
- * Sets the specified bit
- */
-static inline void aic_set_bit(int nr, uint32_t *addr)
-{
-    uint32_t mask = AIC_BIT_MASK(nr);
-    uint32_t *p = aic_bit_ptr(nr, addr);
-    
-    *p |= mask;
-}
-
-/*
- * Clears the specified bit
- */
-static inline void aic_clear_bit(int nr, uint32_t *addr)
-{
-    uint32_t mask = AIC_BIT_MASK(nr);
-    uint32_t *p = aic_bit_ptr(nr, addr);
-    
-    *p &= ~mask;
-}
-
-/*
- * Returns the current status of a specified bit
- */
-static inline bool aic_test_bit(int nr, uint32_t *addr)
-{
-    return addr[AIC_BIT_WORD(nr)] & AIC_BIT_MASK(nr);
-}
-
-/*
- * Sets the bit to the specified value
- */
-static inline void aic_edit_bit(int nr, uint32_t *addr, bool val)
-{
-    if (val) {
-        aic_set_bit(nr, addr);
-    } else {
-        aic_clear_bit(nr, addr);
-    }
-}
-
-/*
- * Clears the provided bitmap
- */
-static inline void aic_zero_bits(uint32_t *addr, int nr)
-{
-    for (int i = 0; i < DIV_ROUND_UP(nr, 32); i++) {
-        addr[i] = 0;
-    }
-}
-
-
-/*
- * Fills the provided bitmap
- */
-static inline void aic_fill_bits(uint32_t *addr, int nr)
-{
-    for (int i = 0; i < DIV_ROUND_UP(nr, 32); i++) {
-        addr[i] = ~0;
-    }
-}
 
 #define TYPE_APPLE_AIC "apple-aic"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleAICState, APPLE_AIC)
 
+/*
+ * Each core has a copy of it's per-core memory region mapped to a per-core
+ * local alias. Unfortunately this (seemingly common) dependency pattern
+ * is not easily expressed in QEMU's views, since it requires creating a unique
+ * container for each CPU's memory region with the main system bus view mapped
+ * in at a lower priority so the per-cpu regions are able to overlap.
+ * 
+ * This quickly becomes a mess with many cores, and is overall confusing since
+ * each core is mostly the same, plus this mapping has to happen externally
+ * somewhat, since the container must contain the rest of memory/peripherals
+ * too. You can't even make it easy by adding them as sysbus regions because
+ * sysbus_mmio_map will map them into the common system bus, which in this case
+ * is not what you want. 
+ * 
+ * Thinking about this too much leads in circles, some peripherals like the 
+ * A9GTimer and the ARM MPTimer have the same problem, but they solve it in
+ * an unfortunate way that involves assuming that the thread local current_cpu
+ * variable is valid, that all the types are ARMCPU compatible, etc.
+ * 
+ * This is not really supposed to be done, while much of qemu device emulation
+ * uses this to get a reference to a cpu index to compute per-cpu offsets for
+ * cpu private regions, there's a very clear comment in part of the address
+ * handling code that makes a note about potentially trying to invalidate
+ * current_cpu before non-ram access is attempted to catch buggy code. (only the
+ * write handler has that comment but the point still stands), this means that
+ * indeed the correct thing to do is to not punt this to the peripheral but to
+ * properly expose each per_cpu region as a seperate mmio region, then let the
+ * SoC code handle initializing each core with it's own view of memory.
+ * 
+ * FIXME before merge
+ * The solution for now is that we want things to work so we'll use this hack,
+ * however ideally we want code to stop doing that, one potential fix that should
+ * work is passing an address space reference for an access. This will be handled
+ * in another set of accessor methods that will fallback to the existing code,
+ * by using the address space, this idea needs a lot of development and some
+ * collaboration from the mailing list and even a partial implementation would still
+ * be more work than I think this kind of structure should be. So for now we use
+ * the hack.
+ */
+struct AICPerCoreState {
+    /* 
+     * This is stored to when interrupts are recalculated
+     * which occurs when any of the IRQ config is changed,
+     * along with when outside interrupts come in, finally
+     * this is also updated by reading the register which
+     * is what masks the incoming IRQs/IPIs, IPIs also
+     * have to be "ACKed" before they will be deasserted
+     */
+    /* IRQ type and #, IPI type and source (self/other) */
+    uint32_t irq_reason;
+    
+    /* IPI pending/mask is per-core */
+    uint32_t ipi_mask;
+    /* 
+     * This holds pending IPIs for this core with the bit index
+     * representing the core sending the IPI
+     */
+    uint32_t ipi_pending;
+    
+    /* Output IRQ line */
+    /* XXX do we want to handle FIQ here too? */
+    qemu_irq irq;
+    
+    /* 
+     * Keep track of existing state so we only send state transitions
+     * This is just used as a bool
+     */
+    uint32_t irq_status;
+};
+
+typedef struct AICPerCoreState AICPerCoreState;
 
 struct AppleAICState {
     /*< private >*/
     SysBusDevice parent_obj;
 
     /*< public >*/
-    /* TODO: Split this into one main dist region and many per-cpu
-     * version
-     */
-    MemoryRegion mmio_region;
+    MemoryRegion mmio_mr;
+    
     /* Number of HW irq inputs */
     uint32_t num_irq;
     uint32_t num_cpu;
-    /* TODO: Make this allocated based on num-cpus */
-    qemu_irq irq_out[AIC_MAX_CPUS];
-    /* 
-     * Keep track of current line state for output IRQs
-     * this is less of an optimization and more of a helper for
-     * debug prints so they don't spam with redundent changes
-     * NOTE: depends on AIC_MAX_CPUS being <= 32 
-     */
-    uint32_t irq_out_status;
     
     /* 
      * NOTE: These are declared as compiled time constants
@@ -248,16 +163,16 @@ struct AppleAICState {
     /* HW IRQ mask and pending */
     AIC_DECLARE_BITMAP(irq_mask, AIC_NUM_IRQ);
     AIC_DECLARE_BITMAP(irq_pending, AIC_NUM_IRQ);
+    
     /* Currently set SW triggered IRQs */
     AIC_DECLARE_BITMAP(sw_pending, AIC_NUM_IRQ);
-    /* Mask and pending for IPIs */
-    uint32_t ipi_mask;
-    uint32_t ipi_pending;
-    
     
     /* TODO: This might need to be a hashtabe to not take up a huge amount
      * of memory just for IRQ distribution storage? */
     uint32_t irq_dist[AIC_NUM_IRQ];
+
+    /* IPIs and IRQ lines are stored in a per-cpu structure */
+    AICPerCoreState core_state[AIC_MAX_CPUS];
 };
 
 #endif /* HW_INTC_APPLE_AIC_H */

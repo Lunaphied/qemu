@@ -101,14 +101,6 @@ static hwaddr device_tree_end = 0;
  */
 static hwaddr safe_ram_start = 0;
 
-/* Helper function to construct mp_affinity from cluster and core */
-/* TODO: I think core and cluster are only 8 bits, and there's another field
- * above cluster maybe? */
-static inline uint32_t m1_mp_affinity(uint32_t cluster, uint32_t core)
-{
-    return (cluster << 8) | (core & 0xFF);
-}
-
 /* Helper function to convert cpu_index to ARMCPU* pointer from complex */
 static ARMCPU* m1_get_cpu_by_index(AppleM1State *s, int cpu_index)
 {
@@ -224,15 +216,18 @@ static void apple_m1_init(Object *obj) {
     AppleM1State *s = APPLE_M1(obj);
 
     /* TODO: Better object names */
-    
+    /* TODO Replace this with properties */
+    s->num_icestorm = APPLE_M1_ICESTORM_CPUS;
+    s->num_firestorm = APPLE_M1_FIRESTORM_CPUS;
     // Initialize CPU cores
-    for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
-        object_initialize_child(obj, "firestorm[*]", &s->firestorm_cores[i],
-                                ARM_CPU_TYPE_NAME("aapl-firestorm"));
-    }
-    for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
+    for (int i = 0; i < s->num_icestorm; i++) {
         object_initialize_child(obj, "icestorm[*]", &s->icestorm_cores[i],
-                                ARM_CPU_TYPE_NAME("aapl-icestorm"));
+                                ARM_CPU_TYPE_NAME("apple-icestorm"));
+    }
+    
+    for (int i = 0; i < s->num_firestorm; i++) {
+        object_initialize_child(obj, "firestorm[*]", &s->firestorm_cores[i],
+                                ARM_CPU_TYPE_NAME("apple-firestorm"));
     }
     
     // Initialize framebuffer

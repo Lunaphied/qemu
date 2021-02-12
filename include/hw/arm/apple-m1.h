@@ -30,9 +30,16 @@ struct AppleM1State {
     DeviceState parent_obj;
 
     /*< public >*/
+    /* Properties */
+    uint32_t num_firestorm;
+    uint32_t num_icestorm;
+    
     /* Cores */
-    ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
+    /* Icestorm  0..num_icestorm-1 */
+    /* Firestorm num_icestorm..num_firestorm-1 */
+    /* TODO Replace this with the proper concept of core clusters */
     ARMCPU icestorm_cores[APPLE_M1_ICESTORM_CPUS];
+    ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
 
     /* SoC devices */
     AppleM1FBState fb;

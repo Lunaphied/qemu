@@ -339,7 +339,7 @@ static const ARMCPRegInfo apple_firestorm_cp_reginfo[] = {
 
 // TODO: Decide what this cpu core should actually be called and if we need to
 // specialize into firestorm/icestorm
-static void aapl_firestorm_initfn(Object *obj)
+static void apple_firestorm_initfn(Object *obj)
 {
     // TODO: Is this really the best way to inherit a CPU arch? we want most
     // of the cortex A72 definitions until we replace more of them
@@ -349,6 +349,7 @@ static void aapl_firestorm_initfn(Object *obj)
     
     ARMCPU *cpu = ARM_CPU(obj);
 
+    /* FIXME: I think Linux is going to go with apple,firestorm */
     cpu->dtb_compatible = "AAPL,firestorm";
     /* Must be unset at the core level because CP registers are defined as EL3
      * access while firestorm/icestorm lack EL3 and they are therefore
@@ -391,19 +392,20 @@ static const ARMCPRegInfo apple_icestorm_cp_reginfo[] = {
     REGINFO_SENTINEL
 };
 
-// TODO: see aapl_firestorm_initfn
-static void aapl_icestorm_initfn(Object *obj)
+// TODO: see apple_firestorm_initfn
+static void apple_icestorm_initfn(Object *obj)
 {
     // TODO:
     // This does nothing except use the right names, the ID registers are wrong
     // and the CP registers are slightly different I think so this will need to
     // change
     // TODO: This is bad because we get the firestorm cp registers too...
-    aapl_firestorm_initfn(obj);
+    apple_firestorm_initfn(obj);
     /* Implementer is Apple, varient is 0, arch is 
      * elsewhere part is icestorm */
     ARMCPU *cpu = ARM_CPU(obj);
     cpu->midr = 0x610F0220;
+    /* FIXME: I think Linux is going to go with apple,icestorm */
     cpu->dtb_compatible = "AAPL,icestorm";
     define_arm_cp_regs(cpu, apple_icestorm_cp_reginfo);
 }
@@ -924,8 +926,8 @@ static const ARMCPUInfo aarch64_cpus[] = {
     { .name = "cortex-a57",         .initfn = aarch64_a57_initfn },
     { .name = "cortex-a53",         .initfn = aarch64_a53_initfn },
     { .name = "cortex-a72",         .initfn = aarch64_a72_initfn },
-    { .name = "aapl-firestorm",     .initfn = aapl_firestorm_initfn },
-    { .name = "aapl-icestorm",      .initfn = aapl_icestorm_initfn },
+    { .name = "apple-firestorm",    .initfn = apple_firestorm_initfn },
+    { .name = "apple-icestorm",     .initfn = apple_icestorm_initfn },
     { .name = "max",                .initfn = aarch64_max_initfn },
 };
 
