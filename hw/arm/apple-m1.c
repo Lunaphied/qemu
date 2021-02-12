@@ -331,20 +331,20 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
      * good to not make QEMU rely on the assumption that CPUs will always be
      * of the same type, at least not more than it does already)
      */
-    for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
-        // TODO: Use wrapper that takes cluster and core id (I think the 0x101
-        // is actually 2 values, 0x1 and 0x1 again, differentiating cluster
-        // and something else)
-        /* All firestorms start off */
-        m1_realize_cpu(&s->firestorm_cores[i], (0x101UL<<8)|i, true);
-    }
-    // Now do the icestorm cores
     for (int i = 0; i < APPLE_M1_ICESTORM_CPUS; i++) {
         // TODO: Use wrapper that takes cluster and core id (I think the 0x101
         // is actually 2 values, 0x1 and 0x1 again, differentiating cluster
         // and something else)
         /* All except core 0 start off */
         m1_realize_cpu(&s->icestorm_cores[i], i, i > 0);
+    }
+    // Now do the firestorm cores
+    for (int i = 0; i < APPLE_M1_FIRESTORM_CPUS; i++) {
+        // TODO: Use wrapper that takes cluster and core id (I think the 0x101
+        // is actually 2 values, 0x1 and 0x1 again, differentiating cluster
+        // and something else)
+        /* All firestorms start off */
+        m1_realize_cpu(&s->firestorm_cores[i], (0x101UL<<8)|i, true);
     }
 
     // Framebuffer init

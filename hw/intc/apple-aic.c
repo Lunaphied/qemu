@@ -58,6 +58,7 @@
 #include "cpu.h"
 #include "qemu/timer.h"
 #include "hw/intc/apple-aic.h"
+#include "trace.h"
 
 /* TODO: Add tracing */
 
@@ -70,11 +71,11 @@
 #define AIC_DIST_END     (AIC_DIST+AIC_DIST_SIZE-1)
 
 /* Packed IRQ bitmaps have this number of bytes */
-#define AIC_IRQ_REG_SIZE ((AIC_NUM_IRQ*4)/32)
+#define AIC_IRQ_REG_SIZE 0x80
 
 /* SW initiated HW IRQs */
 #define AIC_SW_SET       0x4000
-#define AIC_SW_SET_END   (AIC_SW_SET+AIC_IRQ_REG_COUNT-1)
+#define AIC_SW_SET_END   (AIC_SW_SET+AIC_IRQ_REG_SIZE-1)
 #define AIC_SW_CLEAR     0x4080
 #define AIC_SW_CLEAR_END (AIC_SW_CLEAR+AIC_IRQ_REG_SIZE-1)
 
@@ -118,44 +119,10 @@
 
 /* IPI bit positions */
 /* TODO Rename */
-#define AIC_IPI_BIT_OTHER   BIT(31)
-#define AIC_IPI_BIT_SELF    BIT(0)
+#define AIC_IPI_BIT_OTHER   (1<<0U)
+#define AIC_IPI_BIT_SELF    (1<<31U)
 
 /* TODO: Masks and shifts for IRQ reason */
-
-/* HACK: bad bad bad */
-/* Explanation: The AIC as a peripheral has a concept of the
- * current core for accesses there's a "WHOAMI" register that
- * likely reports the value stored in MPIDR, there's a current
- * CPU view of the state (or at least IPIs), then at an offset
- * you can access each specific CPU's view of the registers
- * (at least for IPIs), this is how you send a "self" IPI vs.
- * an "other" IPI. The reason tells you the difference when
- * you get called, but you can trigger a "self" IPI by writing
- * to the self IPI bit using a view into another core's registers
- *
- * The problem is that we don't get passed in a CPU reference
- * when someone accesses the memory. And if access to the
- * peripheral depends on the CPU calling, it's not really on
- * a system bus so much as it is an internal core peripehral
- * with an outside bus interface too. This seems fairly tricky
- * to implement in QEMU, the GICv3 seems to handle this by
- * having a split state, with the GIC initializing per-cpu
- * states that reference their CPU and then registering things
- * like MMIO with a reference to the PER CPU state so we know
- * who's accessing us. Lets do similar but not as hacky, this
- * means letting the board/SoC code provide us with CPU
- * references to use (and their corresponding numbers)
- * TODO: understand if the above solution is good enough
- * TODO: find out how linux maps IPI/dist masks to CPU numbers
- *       might just be based on the info from the device tree
- */
-/* HACK update: Slightly improved, but it's based on current_cpu which
- * relies on only ever having ARM_CPU compatible CPUs emulated and also
- * is probably unreliable in general (the same hack is currently used for
- * timers until both issues get fixed)
- */
-static uint32_t current_reason[AIC_MAX_CPUS] = {0,};
 
 /* Helpers to avoid mystery constants */
 #define AIC_INVALID_IRQ (-1)
@@ -362,14 +329,21 @@ static void aic_update_irq(AppleAICState *s)
             */
             uint32_t valid_ipis = s->core_state[i].ipi_pending & 
                                   ~s->core_state[i].ipi_mask;
+//             if ((i == 0) && s->core_state[i].ipi_pending) {
+//                 qemu_log("Valid IPIs were 0x%x\n", valid_ipis);
+//                 qemu_log("Pending IPIs were 0x%x\n", s->core_state[i].ipi_pending);
+//                 qemu_log("Masked  IPIs were 0x%x\n", s->core_state[i].ipi_mask);
+//             }
             if (valid_ipis) {
                 /* This sets the type and clears the HW IRQ */
                 s->core_state[i].irq_reason = (AIC_IRQ_IPI<<16);
                 /* Right now other IPIs pre-empt self IPIs */
                 if (valid_ipis & AIC_IPI_BIT_OTHER) {
-                    current_reason[i] |= AIC_IPI_TYPE_OTHER;
+                    s->core_state[i].irq_reason |= AIC_IPI_TYPE_OTHER;
+                    //qemu_log("Sent IPI type Other to 0x%x\n", i);
                 } else if (valid_ipis & AIC_IPI_BIT_SELF) {
-                    current_reason[i] |= AIC_IPI_TYPE_SELF;
+                    s->core_state[i].irq_reason |= AIC_IPI_TYPE_SELF;
+                    //qemu_log("Sent IPI type Self to 0x%x\n", i);
                 } else {
                     /* TODO: Replace this with proper assert */
                     error_report("Invalid IPI set 0x%x", valid_ipis);
@@ -453,16 +427,21 @@ static uint32_t aic_read_reason(AppleAICState *s, int cpu_index) {
  */
 static void aic_send_ipi(AppleAICState *s, int cpu, uint32_t value) {
     /* Loop through looking for set IPI bits */
-    for (int i = clz32(value); i < AIC_MAX_CPUS; i++) {
+    for (int i = ctz32(value); i < AIC_MAX_CPUS; i++) {
         if (value & (1<<i)) {
             /* This will set a pending other IPI */
             s->core_state[i].ipi_pending |= AIC_IPI_BIT_OTHER;
+            //qemu_log("IPI triggered from cpu 0x%x to 0x%d\n", cpu, i);
         }
     }
     if (value & AIC_IPI_BIT_SELF) {
         /* This sets a pending self IPI */
         s->core_state[cpu].ipi_pending |= AIC_IPI_BIT_SELF;
+        //qemu_log("SELF IPI triggered from cpu 0x%x\n", cpu);
     }
+    //qemu_log("Input IPI value was 0x%x\n", value);
+    //qemu_log("Self bit was 0x%x\n", AIC_IPI_BIT_SELF);
+    //qemu_log("Other bit was 0x%x\n", AIC_IPI_BIT_OTHER);
     
     /* 
      * TODO is there any performance gains we can get by not scanning the
@@ -594,6 +573,9 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
             aic_update_irq_reg(s, aic_offset_to_reg(offset, AIC_MASK_CLEAR));
         }
         break;
+    case AIC_IRQ_REASON:
+        /* Ignore writes */
+        break;
     case AIC_IPI_SEND:
         aic_send_ipi(s, cpu_index, value);
         break;
@@ -608,7 +590,7 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
         aic_update_irq(s);
         break;
     case AIC_IPI_MASK_CLEAR:
-        s->core_state[cpu_index].ipi_mask |= ~value;
+        s->core_state[cpu_index].ipi_mask &= ~value;
         // TODO: only handle changes/IPIs
         aic_update_irq(s);
         break;
