@@ -11,7 +11,7 @@
 
 #include "qom/object.h"
 #include "target/arm/cpu.h"
-#include "hw/display/apple-m1-fb.h"
+#include "hw/display/m1_fb.h"
 #include "hw/intc/apple-aic.h"
 
 // The M1 has a fixed number of cores, model that
@@ -42,8 +42,12 @@ struct AppleM1State {
     ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
 
     /* SoC devices */
-    AppleM1FBState fb;
+    M1FBState fb;
     AppleAICState aic;
+    
+    /* SoC memory regions */
+    /* FIXME every region created in the .c file needs to move here */
+    MemoryRegion vram_mr;
 };
 
 #endif // HW_ARM_APPLE_M1_H

@@ -5,24 +5,27 @@
  * 
  * SPDX-License-Identifier: MIT
  */
-#ifndef HW_FB_APPLE_M1_FB_H
-#define HW_FB_APPLE_M1_FB_H
+#ifndef HW_FB_M1_FB_H
+#define HW_FB_M1_FB_H
 
 #include "hw/sysbus.h"
 #include "ui/console.h"
 #include "qom/object.h"
 
-#define TYPE_APPLE_M1_FB "apple-m1-fb"
-OBJECT_DECLARE_SIMPLE_TYPE(AppleM1FBState, APPLE_M1_FB);
+#define TYPE_M1_FB "m1-fb"
+OBJECT_DECLARE_SIMPLE_TYPE(M1FBState, M1_FB);
 
-struct AppleM1FBState {
+struct M1FBState {
     /*< private >*/
     SysBusDevice parent_obj;
 
     /*< public >*/
-    MemoryRegion vram;
+    MemoryRegion *vram;
     MemoryRegionSection vram_section;
     QemuConsole *console;
+    
+    /* Configuration data for the FB */
+    uint32_t width, height;
 };
 
-#endif /* HW_FB_APPLE_M1_FB_H */
+#endif /* HW_FB_M1_FB_H */

@@ -35,7 +35,7 @@ softmmu_ss.add(when: 'CONFIG_TCX', if_true: files('tcx.c'))
 softmmu_ss.add(when: 'CONFIG_CG3', if_true: files('cg3.c'))
 softmmu_ss.add(when: 'CONFIG_MACFB', if_true: files('macfb.c'))
 softmmu_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
-softmmu_ss.add(when: 'CONFIG_APPLE_M1', if_true: files('apple-m1-fb.c'))
+softmmu_ss.add(when: 'CONFIG_APPLE_M1', if_true: files('m1_fb.c'))
 
 specific_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))
 

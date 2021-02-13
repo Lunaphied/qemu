@@ -462,7 +462,7 @@ static void aic_send_ipi(AppleAICState *s, int cpu, uint32_t value) {
  * everything else should have this detail abstracted out as a parameter
  * for when the proper code is written.
  */
-static CPUState* get_current_cpu() {
+static CPUState* get_current_cpu(void) {
     /* FIXME this is broken by design */
     CPUState *cpu = CPU(current_cpu);
     return cpu;

@@ -64,7 +64,7 @@ enum {
     M1_WDT,         // The M1 Watchdog timer. This is probably actually part of the AIC
     M1_ROM,         // We setup a block of ROM to keep the initial boot code in
     M1_ARGS,        // A bit of ROM to hold the bootargs
-    M1_FB,          // The M1N1 code expects a framebuffer, for now this just means to dump ram in this region
+    M1_VRAM,        // The M1N1 code expects a framebuffer, for now this just means to dump ram in this region
     M1_PMGR,        // Peripheral used to set cores to on (and theoretically off) along with giving them a reset vector address to start at
 };
 // This is used in several other ARM platforms to help collect the addresses and give them meaningful names
@@ -79,7 +79,7 @@ static const struct MemMapEntry memmap[] = {
     [M1_WDT] =              { 0x23D2B0000,                0x100},
     /* TODO: replace this with a real addr from hardware */
     [M1_PMGR] =             { 0x23D300000,                0x100},
-    [M1_FB] =               { 0x300000000,                8*GiB},
+    [M1_VRAM] =             { 0x300000000,                8*GiB},
     [M1_MEM] =              { 0x800000000,       RAMLIMIT_BYTES},
 };
 
@@ -230,12 +230,10 @@ static void apple_m1_init(Object *obj) {
                                 ARM_CPU_TYPE_NAME("apple-firestorm"));
     }
     
-    // Initialize framebuffer
-    object_initialize_child(obj, "framebuffer", &s->fb,
-		    		TYPE_APPLE_M1_FB);
-    
+    /* Initialize framebuffer */
+    object_initialize_child(obj, "fb", &s->fb, TYPE_M1_FB);
     // Initialize interrupt controller
-    object_initialize_child(obj, "apple-aic", &s->aic, TYPE_APPLE_AIC);
+    object_initialize_child(obj, "aic", &s->aic, TYPE_APPLE_AIC);
 }
 
 // Apple M1 reset needs us to put the correct x0 register to point to our boot args
@@ -347,14 +345,21 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
         m1_realize_cpu(&s->firestorm_cores[i], (0x101UL<<8)|i, true);
     }
 
-    // Framebuffer init
-    // TODO: Set framebuffer memory area size as a property and connect it to the memory map here
-    // (This is all temporary until the mapping system is understood enough to have framebuffer be
-    // just another part of normal RAM with a default mapping) (which I also don't know how to setup
-    // properly in qemu but VGA PCI stuff might be similar)
-    AppleM1FBState *fb = &s->fb;
-    sysbus_realize(SYS_BUS_DEVICE(fb), &error_abort);
-    sysbus_mmio_map(SYS_BUS_DEVICE(fb), 0, memmap[M1_FB].base);
+    /* 
+     * Realize framebuffer, first we have to setup the memory region for VRAM
+     * then we have to setup the property link to that region
+     */
+    memory_region_init_ram(&s->vram_mr, OBJECT(s), "vram", memmap[M1_VRAM].size,
+                           &error_abort);
+    /* Map the region */
+    memory_region_add_subregion(get_system_memory(), memmap[M1_VRAM].base,
+                                &s->vram_mr);
+    /* Add link for vram */
+    object_property_add_const_link(OBJECT(&s->fb), "vram", OBJECT(&s->vram_mr));
+    
+    /* Now we're safe to realize the device */
+    /* TODO: If the framebuffer never gets MMIO it should not be sysbus */
+    sysbus_realize(SYS_BUS_DEVICE(&s->fb), &error_abort);
 
     // XXX: This code needs to be made more generic before it could sanely be attached here
     //      also it seems serial_hd(x) is bad practice for getting the chardev, but I can't see
@@ -528,9 +533,6 @@ static void create_apple_dt(MachineState *machine) {
 }
 
 #define BOOTARGS_REVISION 0xDEAD
-#define BOOTARGS_FB_WIDTH 800
-#define BOOTARGS_FB_HEIGHT 600
-#define BOOTARGS_FB_STRIDE (BOOTARGS_FB_WIDTH*4)
 #define BOOTARGS_FB_DEPTH 30
 
 // This builds and then inserts a boot args structure like m1n1 and OS X expect
@@ -541,6 +543,12 @@ static void create_apple_dt(MachineState *machine) {
  * on safe_ram_start being defined
  */
 static void create_boot_args(MachineState *machine) {
+    /* TODO: Make this a cleaner setup where the machine has a struct
+     * with the M1 SoC inside */
+    AppleM1State *soc;
+    Object *obj = object_property_get_link(OBJECT(machine), "soc", &error_abort);
+    soc = APPLE_M1(obj);
+    /* TODO move this struct out of the function */
     struct {
         uint16_t revision;
         uint16_t pad0;
@@ -567,10 +575,11 @@ static void create_boot_args(MachineState *machine) {
     bootargs.physical_load_base = memmap[M1_MEM].base;
     bootargs.memory_size = machine->ram_size;
     bootargs.loaded_end = safe_ram_start;
-    bootargs.fb_addr = memmap[M1_FB].base;
-    bootargs.fb_stride = BOOTARGS_FB_STRIDE;
-    bootargs.fb_width = BOOTARGS_FB_WIDTH;
-    bootargs.fb_height = BOOTARGS_FB_HEIGHT;
+    bootargs.fb_addr = memmap[M1_VRAM].base;
+    /* TODO Clean this up */
+    bootargs.fb_stride = soc->fb.width*4;
+    bootargs.fb_width = soc->fb.width;
+    bootargs.fb_height = soc->fb.height;
     bootargs.fb_depth = BOOTARGS_FB_DEPTH;
 
     // FIXME: There's got to be a better way of doing it than this. Maybe a property or something? Maybe not?
