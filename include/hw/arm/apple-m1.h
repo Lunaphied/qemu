@@ -25,6 +25,13 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleM1State, APPLE_M1)
 
+// A RAM memory region that is reloaded from static data on reset
+struct m1_rel_region {
+    MemoryRegion region;
+    void* data;
+};
+
+
 struct AppleM1State {
     /*< private >*/
     DeviceState parent_obj;
@@ -46,8 +53,14 @@ struct AppleM1State {
     AppleAICState aic;
     
     /* SoC memory regions */
-    /* FIXME every region created in the .c file needs to move here */
-    MemoryRegion vram_mr;
+    struct m1_rel_region ram_adt_mr;
+    struct m1_rel_region ram_firmware_mr;
+    struct m1_rel_region ram_kernel_mr;
+    struct m1_rel_region ram_initrd_mr;
+    struct m1_rel_region ram_dtb_mr;
+    struct m1_rel_region ram_bootargs_mr;
+    MemoryRegion ram_free_mr;
+    MemoryRegion ram_vram_mr;
 };
 
 #endif // HW_ARM_APPLE_M1_H

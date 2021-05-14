@@ -31,6 +31,8 @@
 #include "arm-powerctl.h"
 #include "hw/arm/apple-m1.h"
 
+#include <err.h>
+
 // Notes on this file:
 // - This file doesn't actually represent the M1 very well, it's more a platform designed and focused around m1n1
 // - The ARM IRQ pin is directly connected to the UART, which is helpful if you want to test the simplest 
@@ -52,6 +54,9 @@
 #define RAMLIMIT_GB     8192
 #define RAMLIMIT_BYTES  (RAMLIMIT_GB * GiB)
 
+#define VRAM_ZONE_SIZE (500 * MiB)
+#define ADT_MAX_SIZE 0x1000
+
 /* 
  * TODO: this way of mapping memory is probably not ideal, (it's hard to add
  * multiple regions of ram split by IO, we should instead construct this from
@@ -62,9 +67,7 @@ enum {
     M1_UART,        // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
     M1_AIC,         // The Apple interrupt controller
     M1_WDT,         // The M1 Watchdog timer. This is probably actually part of the AIC
-    M1_ROM,         // We setup a block of ROM to keep the initial boot code in
     M1_ARGS,        // A bit of ROM to hold the bootargs
-    M1_VRAM,        // The M1N1 code expects a framebuffer, for now this just means to dump ram in this region
     M1_PMGR,        // Peripheral used to set cores to on (and theoretically off) along with giving them a reset vector address to start at
 };
 // This is used in several other ARM platforms to help collect the addresses and give them meaningful names
@@ -72,34 +75,14 @@ enum {
 // them up like this during dev (the UART is the correct address for where it is when m1n1 loads though)
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
 static const struct MemMapEntry memmap[] = {
-    [M1_ROM] =              {         0x0,              0x10000},
     //[M1_SPINTABLE] =        {     0x10000,                0x100},
     [M1_UART] =             { 0x235200000,              0x10000},
     [M1_AIC] =              { 0x23B100000,              0x10000},
     [M1_WDT] =              { 0x23D2B0000,                0x100},
     /* TODO: replace this with a real addr from hardware */
     [M1_PMGR] =             { 0x23D300000,                0x100},
-    [M1_VRAM] =             { 0x300000000,                8*GiB},
     [M1_MEM] =              { 0x800000000,       RAMLIMIT_BYTES},
 };
-
-// TODO: Get rid of this and just handle returning the size from the boot args
-// and device create creation code, also those should be stuffed in ram that's
-// initialized at boot instead of into ROM, ROM should be tiny and used for
-// initializing stuff before jumping in
-static hwaddr device_tree_end = 0;
-
-/*
- * TODO: get rid of this? (or split the boot code into it's own file maybe
- *       a lot of this process for boot is similar to the unique process
- *       that the x86 microvm does (specifically the PVH load))
- */
-
-/* 
- * This stores the first address after the loaded kernel (which might be M1N1
- * alone or a collection of M1N1+linux+device tree+initrd)
- */
-static hwaddr safe_ram_start = 0;
 
 /* Helper function to convert cpu_index to ARMCPU* pointer from complex */
 static ARMCPU* m1_get_cpu_by_index(AppleM1State *s, int cpu_index)
@@ -236,23 +219,80 @@ static void apple_m1_init(Object *obj) {
     object_initialize_child(obj, "aic", &s->aic, TYPE_APPLE_AIC);
 }
 
-// Apple M1 reset needs us to put the correct x0 register to point to our boot args
+/* Reload a RAM memory region with static content. */
+static void reload_memory_region(struct m1_rel_region* rel_region) {
+    size_t size = memory_region_size(&rel_region->region);
+
+    if (size == 0) {
+        return;
+    }
+
+    void* ptr = memory_region_get_ram_ptr(&rel_region->region);
+    memcpy(ptr, rel_region->data, size);
+}
+
+/* Get the absolute address of a memory region */
+static hwaddr get_absolute_addr(MemoryRegion* region)
+{
+    /* FIXME: There is probably a better way to do this */
+    hwaddr addr = 0;
+
+    while (region != NULL) {
+        addr += region->addr;
+        region = region->container;
+    }
+
+    return addr;
+}
+
+static void apple_m1_finalize(Object *obj) {
+    AppleM1State *s = APPLE_M1(obj);
+
+    free(s->ram_adt_mr.data);
+    s->ram_adt_mr.data = NULL;
+
+    free(s->ram_firmware_mr.data);
+    s->ram_firmware_mr.data = NULL;
+
+    free(s->ram_initrd_mr.data);
+    s->ram_initrd_mr.data = NULL;
+
+    free(s->ram_dtb_mr.data);
+    s->ram_dtb_mr.data = NULL;
+
+    free(s->ram_bootargs_mr.data);
+    s->ram_bootargs_mr.data = NULL;
+}
+
+/* Reset handler: put firmware, ADT boot-args in RAM and set registers */
 static void handle_m1_reset(void *opaque)
 {
     ARMCPU *cpu = ARM_CPU(opaque);
-    // TODO: Change all this logic into a blob that gets dropped into
-    //       the rom area
-    // TODO: More sanely seperate device_tree_end and boot args
     // FIXME: It's possible this should be replaced by a rom region that does this
     // while executing on the cpu
     
+    AppleM1State *m1 = APPLE_M1(OBJECT(cpu)->parent);
+
+    reload_memory_region(&m1->ram_adt_mr);
+    reload_memory_region(&m1->ram_firmware_mr);
+    reload_memory_region(&m1->ram_kernel_mr);
+    reload_memory_region(&m1->ram_initrd_mr);
+    reload_memory_region(&m1->ram_dtb_mr);
+    reload_memory_region(&m1->ram_bootargs_mr);
+
+    hwaddr boot_args_addr = get_absolute_addr(&m1->ram_bootargs_mr.region);
+
+    /* FIXME: Parse the firmware to determine its entry point */
+    hwaddr entry_point = get_absolute_addr(&m1->ram_firmware_mr.region)
+        + 0x4800;
+
     // INFO: This way of doing things is actually done on several other machines mostly
     // not ARM ones though, but using the reset vector like this is fair, most of them
     // load a bootrom bios into a fixed location, setup the registers to a loaded main binary
     // image (or just let the bootrom work) and then set the PC to the entrypoint
     cpu_reset(CPU(cpu));
-    cpu->env.xregs[0] = device_tree_end;
-    cpu_set_pc(CPU(cpu), memmap[M1_MEM].base+0x4800);
+    cpu->env.xregs[0] = boot_args_addr;
+    cpu_set_pc(CPU(cpu), entry_point);
     // FIXME: This seems like a crazy way to initialize this but there's no easy
     // way to do it at the CPU level because CPU reset will reset this to 0.
     // There might be a better way if I look deeper though but this works okay for now
@@ -345,17 +385,12 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
         m1_realize_cpu(&s->firestorm_cores[i], (0x101UL<<8)|i, true);
     }
 
-    /* 
-     * Realize framebuffer, first we have to setup the memory region for VRAM
-     * then we have to setup the property link to that region
-     */
-    memory_region_init_ram(&s->vram_mr, OBJECT(s), "vram", memmap[M1_VRAM].size,
-                           &error_abort);
-    /* Map the region */
-    memory_region_add_subregion(get_system_memory(), memmap[M1_VRAM].base,
-                                &s->vram_mr);
+    /* Create Video RAM region */
+    memory_region_init_ram(&s->ram_vram_mr, OBJECT(s), "vram",
+        VRAM_ZONE_SIZE, &error_fatal);
+
     /* Add link for vram */
-    object_property_add_const_link(OBJECT(&s->fb), "vram", OBJECT(&s->vram_mr));
+    object_property_add_const_link(OBJECT(&s->fb), "vram", OBJECT(&s->ram_vram_mr));
     
     /* Now we're safe to realize the device */
     /* TODO: If the framebuffer never gets MMIO it should not be sysbus */
@@ -445,6 +480,7 @@ static const TypeInfo apple_m1_type_info = {
     .parent = TYPE_DEVICE,
     .instance_size = sizeof(AppleM1State),
     .instance_init = apple_m1_init,
+    .instance_finalize = apple_m1_finalize,
     .class_init = apple_m1_class_init,
 };
 
@@ -455,40 +491,11 @@ static void apple_m1_register_types(void)
 
 type_init(apple_m1_register_types);
 
-// This builds an apple style device tree then inserts it into memory somewhere, 
-// TODO: Make this a lot nicer (model after the virt platform fdt builders)
-// it should be dynamic (ideally we would take an existing device tree from
-// hardware and then create the other devices using the information so contained
-static void create_apple_dt(MachineState *machine) {
-    struct node_header {
-        uint32_t prop_count;
-        uint32_t child_count;
-    };
-    struct node_property {
-        char name[32];
-        uint32_t size;
-        // after this is a blob of size data (plus padding to align, which is annoying to express)
-    };
-    // TODO: Put more contents in here and do this correctly
-    // FIXME: size this buffer more properly
-    uint32_t bufsize = 0x1000;
-    //uint8_t *databuf = g_malloc0(bufsize);
-#if 0
-    // Add initial root header?
-    struct node_header header = {0x0, 0x1};
-    memcpy(databuf, &header, sizeof(header));
-    databuf += sizeof(header);
-
-    // Add chosen header?
-    header = {0x0, 0x0};
-    memcpy(databuf, &header, sizeof(header));
-    databuf += sizeof(header);
-    struct node_header chosen = {2, 0};
-    struct node_property prop_temp;
-    // Add a parent property for the chosen tree?
-    snprintf(prop_temp.name, 32, "chosen");
-    prop_temp.size = 0;
-#endif
+/*
+ * Define the data and size of the device tree reloadable memory region.
+ * The memory mappings must be done beforehand.
+ */
+static void setup_adt(AppleM1State *m1) {
     // This was generated using an external tool by taking a dts base, compiling to fdt
     // then converting to adt format. Full ADT support will be needed if we want to boot
     // OS X though so that we can feed it all the nodes (a modified real ADT dump could 
@@ -524,75 +531,148 @@ static void create_apple_dt(MachineState *machine) {
                0x7a, 0x65, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0};
-    bufsize = sizeof(databuf);
-    printf("Mapping device tree at: %" PRIx64 "\n", memmap[M1_ROM].base);
-    rom_add_blob_fixed("device-tree", databuf, bufsize, memmap[M1_ROM].base);
-    //g_free(databuf);
-    // XXX: Make this use the actual size?
-    device_tree_end = QEMU_ALIGN_UP(bufsize + memmap[M1_ROM].base, 64);
+    size_t bufsize = sizeof(databuf);
+
+    if (bufsize > ADT_MAX_SIZE) {
+        error_report("ADT size (%zu) exceeds max size! "
+            "Increase ADT_MAX_SIZE.\n", bufsize);
+        exit(1);
+    }
+
+    char* adt_data = g_malloc(bufsize);
+    memcpy(adt_data, databuf, bufsize);
+
+    m1->ram_adt_mr.data = adt_data;
+    memory_region_ram_resize(&m1->ram_adt_mr.region, bufsize, &error_fatal);
 }
 
 #define BOOTARGS_REVISION 0xDEAD
 #define BOOTARGS_FB_DEPTH 30
 
-// This builds and then inserts a boot args structure like m1n1 and OS X expect
-// it then puts it into memory (I've moved it to 0x10 so that it's not set to
-// a null pointer)
-/* 
- * NOTE: Must be called after the data is loaded into memory since it relies
- * on safe_ram_start being defined
- */
-static void create_boot_args(MachineState *machine) {
-    /* TODO: Make this a cleaner setup where the machine has a struct
-     * with the M1 SoC inside */
-    AppleM1State *soc;
-    Object *obj = object_property_get_link(OBJECT(machine), "soc", &error_abort);
-    soc = APPLE_M1(obj);
-    /* TODO move this struct out of the function */
-    struct {
-        uint16_t revision;
-        uint16_t pad0;
-        uint32_t pad1;
-        uint64_t virtual_load_base; // TODO: document if this is a load base or memory base
-        uint64_t physical_load_base;
-        uint64_t memory_size;
-        uint64_t loaded_end;        // End address of loaded binary (safe mem starts here)
-        uint64_t fb_addr;           // Framebuffer address in memory
-        uint64_t pad2;
-        uint64_t fb_stride;         // Stride (bytes per line)
-        uint64_t fb_width;
-        uint64_t fb_height;
-        uint64_t fb_depth;          // TODO: Extract what real hardware puts here
-        uint64_t pad3;
-        uint64_t device_tree;
-        uint32_t device_tree_size;
-        char cmdline[608];
-        uint64_t flags;
-        uint64_t unknown;
-    } bootargs;
-    bootargs.revision = 0xdead;
-    bootargs.virtual_load_base = memmap[M1_MEM].base;
-    bootargs.physical_load_base = memmap[M1_MEM].base;
-    bootargs.memory_size = machine->ram_size;
-    bootargs.loaded_end = safe_ram_start;
-    bootargs.fb_addr = memmap[M1_VRAM].base;
-    /* TODO Clean this up */
-    bootargs.fb_stride = soc->fb.width*4;
-    bootargs.fb_width = soc->fb.width;
-    bootargs.fb_height = soc->fb.height;
-    bootargs.fb_depth = BOOTARGS_FB_DEPTH;
+struct m1_boot_args {
+    uint16_t revision;
+    uint16_t pad0;
+    uint32_t pad1;
+    uint64_t virtual_load_base; // TODO: document if this is a load base or memory base
+    uint64_t physical_load_base;
+    uint64_t memory_size;
+    uint64_t loaded_end;        // End address of loaded binary (safe mem starts here)
+    uint64_t fb_addr;           // Framebuffer address in memory
+    uint64_t pad2;
+    uint64_t fb_stride;         // Stride (bytes per line)
+    uint64_t fb_width;
+    uint64_t fb_height;
+    uint64_t fb_depth;          // TODO: Extract what real hardware puts here
+    uint64_t pad3;
+    uint64_t device_tree;
+    uint32_t device_tree_size;
+    char cmdline[608];
+    uint64_t flags;
+    uint64_t mem_size_act;
+};
 
-    // FIXME: There's got to be a better way of doing it than this. Maybe a property or something? Maybe not?
-    bootargs.device_tree = memmap[M1_ROM].base;
-    bootargs.device_tree_size = device_tree_end - memmap[M1_ROM].base;
+/*
+ * Define the data of the boot-arg reloadable memory region.
+ * The memory mappings (including the actual ADT size) must be done
+ * beforehand.
+ */
+static void setup_boot_args(AppleM1State *m1, uint64_t total_ram_size) {
+    struct m1_boot_args *boot_args = g_malloc0(sizeof(struct m1_boot_args));
+    uint64_t free_ram_start = get_absolute_addr(&m1->ram_free_mr);
+    uint64_t free_ram_size = memory_region_size(&m1->ram_free_mr);
+
+    boot_args->revision = cpu_to_le16(0xdead);
+    boot_args->virtual_load_base = cpu_to_le64(memmap[M1_MEM].base);
+    boot_args->physical_load_base = cpu_to_le64(memmap[M1_MEM].base);
+    boot_args->memory_size = cpu_to_le64(free_ram_size);
+    boot_args->loaded_end = cpu_to_le64(free_ram_start);
+
+    uint64_t video_ram_start = get_absolute_addr(&m1->ram_vram_mr);
+    boot_args->fb_addr = cpu_to_le64(video_ram_start);
+    /* TODO Clean this up */
+    boot_args->fb_stride = cpu_to_le64(m1->fb.width * 4);
+    boot_args->fb_width = cpu_to_le64(m1->fb.width);
+    boot_args->fb_height = cpu_to_le64(m1->fb.height);
+    boot_args->fb_depth = cpu_to_le64(BOOTARGS_FB_DEPTH);
+
+    uint64_t adt_start = get_absolute_addr(&m1->ram_adt_mr.region);
+    uint64_t adt_size = memory_region_size(&m1->ram_adt_mr.region);
+
+    boot_args->device_tree = cpu_to_le64(adt_start);
+    boot_args->device_tree_size = cpu_to_le64(adt_size);
 
     char buf[] ="no cmdline lol";
-    memset(bootargs.cmdline, 0, sizeof(bootargs.cmdline));
-    memcpy(bootargs.cmdline, buf, sizeof(buf)); // FIXME: This is stupid
-    bootargs.cmdline[sizeof(buf)] = 0x0;
+    memset(boot_args->cmdline, 0, sizeof(boot_args->cmdline));
+    memcpy(boot_args->cmdline, buf, sizeof(buf)); // FIXME: This is stupid
+    boot_args->cmdline[sizeof(buf)] = 0x0;
 
-    printf("Mapping boot args tree at: %" PRIx64 "\n", device_tree_end);
-    rom_add_blob_fixed("boot-args", &bootargs, sizeof(bootargs), device_tree_end);
+    boot_args->mem_size_act = cpu_to_le64(total_ram_size);
+
+    m1->ram_bootargs_mr.data = boot_args;
+}
+
+/*
+ * Initialize a reloadable region from a file.
+ * If path is NULL, a zero-sized region is initialized.
+ */
+static void init_rel_region_from_file(Object *owner, const char *name,
+    struct m1_rel_region *rel_region, const char *path)
+{
+    if (path == NULL) {
+        memory_region_init(&rel_region->region, owner, name, 0);
+        rel_region->data = NULL;
+        return;
+    }
+
+    int fd = open(path, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        err(EXIT_FAILURE, "Error loading %s region: open(%s)", name, path);
+    }
+
+    int64_t size = lseek(fd, 0, SEEK_END);
+    if (size < 0) {
+        err(EXIT_FAILURE, "Error loading %s region: lseek(%s)", name, path);
+    }
+
+    rel_region->data = g_malloc((uint64_t)size);
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        err(EXIT_FAILURE, "Error loading %s region: lseek(%s)", name, path);
+    }
+
+    int64_t result = read(fd, rel_region->data, (uint64_t)size);
+    if (result < 0) {
+        err(EXIT_FAILURE, "Error loading %s region: read(%s)", name, path);
+    }
+
+    if (result != size) {
+        errx(EXIT_FAILURE, "Error loading %s region: short read from %s", name,
+            path);
+    }
+
+    close(fd);
+
+    memory_region_init_ram(&rel_region->region, owner, name, (uint64_t)size,
+        &error_fatal);
+}
+
+/* Map a region to RAM */
+static void map_ram_region(MemoryRegion* ram_region, MemoryRegion *to_map,
+    uint64_t alignment, hwaddr *offset)
+{
+    hwaddr cur_offset = QEMU_ALIGN_UP(*offset, alignment);
+    const char* name = memory_region_name(to_map);
+    uint64_t size = memory_region_size(to_map);
+
+    if (size == 0) {
+        return;
+    }
+
+    printf("Mapping %s (size 0x%" PRIx64 ") at RAM offset 0x%" PRIx64 "\n",
+        name, size, cur_offset);
+    memory_region_add_subregion(ram_region, cur_offset, to_map);
+
+    *offset = cur_offset + memory_region_size(to_map);
 }
 
 static void m1_mac_init(MachineState *machine)
@@ -600,33 +680,16 @@ static void m1_mac_init(MachineState *machine)
     AppleM1State *m1;
 
     m1 = APPLE_M1(qdev_new(TYPE_APPLE_M1));
+
+    Object* m1_obj = OBJECT(m1);
+
     object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
     qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
-
-    // This initializes the memory region map
-    MemoryRegion *sysmem = get_system_memory();
-
-    /* 
-     * I think it's okay that this doesn't get freed later since many machines
-     * create unfreed memory in their init, since it seems machines aren't meant
-     * to be created multiple times ever, it's also the only way to create
-     * anonymous MemoryRegion blocks which is helpful when you have lots of them
-     * and don't need to keep the pointers other than for potential freeing
-     */
-    /* Create a memory region for the boot arguments (boot_args, ADT, startup code) */
-    MemoryRegion *boot_args = g_new0(MemoryRegion, 1);
-    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[M1_ROM].size,
-                           &error_abort);
-    /* Add the ROM region to the system memory map */
-    memory_region_add_subregion(sysmem, memmap[M1_ROM].base, boot_args);
-    /* Add the RAM created for us to the main system memory space */
-    memory_region_add_subregion(sysmem, memmap[M1_MEM].base, machine->ram);
 
     /* This is for loading M1N1 which acts as a sort of replacement firmware */
     /* We will want to do some sort of stub firmware loader first before M1N1
      * to setup the registers and boot args it expects, but for now we abuse
-     * the reset handler and use ROM regions (we want to replace these with RAM
-     * that reloads on CPU reset or something)
+     * the reset handler and use ROM regions
      * 
      * NOTE: we cannot really use the helper functions from arm/boot.c because
      * loading elfs offers no control over the load address (it just uses the
@@ -663,97 +726,78 @@ static void m1_mac_init(MachineState *machine)
      * TL;DR There's a plan for loading, for now it's almost the simplest thing
      * but not quite.
      */
-    safe_ram_start = memmap[M1_MEM].base;
     
-    /* Keeps base and size so we can write a boot_param.config for qemu loader */
-    hwaddr kernel_base = 0;
-    int kernel_size = 0;
-    hwaddr dtb_base = 0;
-    int dtb_size = 0;
-    hwaddr initrd_base = 0;
-    int initrd_size = 0;
-    
-    /* TODO move these to specific helper functions, model after ppc/riscv boot
-     * helper code which *does* work well with platforms that don't want to
-     * have reset handled (unlike the ARM booter functions) */
-    if (machine->firmware) {
-        /* Align firmware to a 4K page */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 4096);
-        //printf("Found firmware: %s\n", machine->firmware);
-        int load_size = load_image_targphys(machine->firmware, safe_ram_start,
-                                        memmap[M1_MEM].size);
-        if (kernel_size < 0) {
-            error_report("Failed to load firmware from %s", machine->firmware);
-            exit(1);
-        }
-        printf("Firmware loaded@%0" PRIx64 " size=%0x\n", safe_ram_start, load_size);
-        safe_ram_start += load_size;
+    /* Initialize the reloadable regions */
+
+    /* ADT (memory region only; the ADT data is determined after mapping) */
+    memory_region_init_resizeable_ram(&m1->ram_adt_mr.region, m1_obj, "adt",
+        ADT_MAX_SIZE, ADT_MAX_SIZE, NULL, &error_fatal);
+
+    /* Firmware */
+    init_rel_region_from_file(m1_obj, "firmware", &m1->ram_firmware_mr,
+        machine->firmware);
+
+    /* Kernel */
+    init_rel_region_from_file(m1_obj, "kernel", &m1->ram_kernel_mr,
+        machine->kernel_filename);
+
+    /* Initrd */
+    init_rel_region_from_file(m1_obj, "initrd", &m1->ram_initrd_mr,
+        machine->initrd_filename);
+
+    /* Linux device tree */
+    init_rel_region_from_file(m1_obj, "dtb", &m1->ram_dtb_mr,
+        machine->dtb);
+
+    /* boot-args (memory region only; ADT data is determined after mapping) */
+    memory_region_init_ram(&m1->ram_bootargs_mr.region, m1_obj, "boot-args",
+        sizeof(struct m1_boot_args), &error_fatal);
+
+    /* The video RAM region is initialized during realization */
+
+    /* Map the RAM and its regions */
+    memory_region_add_subregion(get_system_memory(), memmap[M1_MEM].base,
+        machine->ram);
+
+    /* FIXME: This respects the order of these components on a real M1,
+     * but there are some gaps between them */
+    hwaddr offset = 0;
+    map_ram_region(machine->ram, &m1->ram_adt_mr.region, 8, &offset);
+
+    /* Align firmware to a 16K page */
+    map_ram_region(machine->ram, &m1->ram_firmware_mr.region, 16384, &offset);
+
+    /* Align kernel to a 2MB addr */
+    map_ram_region(machine->ram, &m1->ram_kernel_mr.region, 2 * 1024 * 1024,
+        &offset);
+
+    map_ram_region(machine->ram, &m1->ram_dtb_mr.region, 1, &offset);
+
+    /* Align initrd to 64K like M1N1 does for some reason */
+    map_ram_region(machine->ram, &m1->ram_initrd_mr.region, 65536, &offset);
+
+    /* Put some space between the payload and the boot args */
+    /* FIXME: Find the right offset */
+    offset += 0x100000;
+
+    map_ram_region(machine->ram, &m1->ram_bootargs_mr.region, 8, &offset);
+
+    /* Map the VRAM at the end of the RAM, leaving some free space */
+    uint64_t total_ram_size = memory_region_size(machine->ram);
+    if ((offset + VRAM_ZONE_SIZE) > total_ram_size) {
+        error_report("Insufficient RAM size.\n");
+        exit(1);
     }
-    
-    if (machine->kernel_filename) {
-        /* Align kernel to a 2MB addr */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 2 * 1024 * 1024);
-        kernel_base = safe_ram_start;
-        printf("Found kernel: %s\n", machine->kernel_filename);
-        kernel_size = load_image_targphys(machine->kernel_filename, kernel_base,
-                                        memmap[M1_MEM].size);
-        if (kernel_size < 0) {
-            error_report("Failed to load kernel from %s", machine->kernel_filename);
-            exit(1);
-        }
-        printf("Kernel loaded@%0" PRIx64 " size=%0x\n", kernel_base, kernel_size);
-        safe_ram_start += kernel_size;
-    }
-    
-    if (machine->dtb) {
-        printf("Found dtb: %s\n", machine->dtb);
-        dtb_base = safe_ram_start;
-        dtb_size = load_image_targphys(machine->dtb, dtb_base, 
-                                       memmap[M1_MEM].size);
-        if (dtb_size < 0) {
-            error_report("Failed to load dtb from %s", machine->dtb);
-            exit(1);
-        }
-        printf("DTB loaded@%0" PRIx64 " size=%0x\n", dtb_base, dtb_size);
-        safe_ram_start += dtb_size;
-    }
-    
-    if (machine->initrd_filename) {
-        /* Align initrd to 64K like M1N1 does for some reason */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 65536);
-        initrd_base = safe_ram_start;
-        printf("Found initrd: %s\n", machine->initrd_filename);
-        initrd_size = load_image_targphys(machine->initrd_filename, initrd_base,
-                                        memmap[M1_MEM].size);
-        if (initrd_size < 0) {
-            error_report("Failed to load initrd from %s", machine->initrd_filename);
-            exit(1);
-        }
-        printf("Initrd loaded@%0" PRIx64 " size=%0x\n", initrd_base, initrd_size);
-        safe_ram_start += initrd_size;
-    }
-    /* TODO: do this in a better way or not at all it's helpful for dev tho */
-    FILE *fconfig = fopen("boot_params.config", "w");
-    if (fconfig != NULL) {
-        if (kernel_base) {
-            fprintf(fconfig, "kernel\t0x%" PRIx64 "\t0x%x\n", kernel_base, kernel_size);
-        }
-        if (dtb_base) {
-            fprintf(fconfig, "dtb\t0x%" PRIx64 "\t0x%x\n", dtb_base, dtb_size);
-        }
-        if (initrd_base) {
-            fprintf(fconfig, "initrd\t0x%" PRIx64 "\t0x%x\n", initrd_base, initrd_size);
-        }
-        fclose(fconfig);
-    }
-    /* 
-     * NOTE: These come after because we need to know the size of the loaded
-     * data to safely load things
-     */
-    // Add apple flavored device tree
-    create_apple_dt(machine);
-    // Add boot args
-    create_boot_args(machine);
+
+    memory_region_init_ram(&m1->ram_free_mr, m1_obj, "free-space",
+        total_ram_size - VRAM_ZONE_SIZE - offset, &error_fatal);
+
+    map_ram_region(machine->ram, &m1->ram_free_mr, 1, &offset);
+    map_ram_region(machine->ram, &m1->ram_vram_mr, 1, &offset);
+
+    /* Initialize the ADT and the boot args */
+    setup_adt(m1);
+    setup_boot_args(m1, total_ram_size);
 }
 
 static void m1_mac_machine_init(MachineClass *mc)
