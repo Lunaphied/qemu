@@ -521,7 +521,7 @@ static uint64_t aic_mem_read(void *opaque, hwaddr offset, unsigned size)
         /* TODO: this is bad and broken, we need per-cpu state to do this */
         return (aic_emulate_timer(ARM_CPU(cpu)) >> 32) & 0xFFFFFFFF;
     default:
-        printf("aic_mem_read: Unhandled read from @%0lx of size=%d\n",
+        printf("aic_mem_read: Unhandled read from @%0" PRIx64 " of size=%d\n",
                offset, size);
     }
     return 0;
@@ -595,8 +595,8 @@ static void aic_mem_write(void *opaque, hwaddr offset, uint64_t val,
         aic_update_irq(s);
         break;
     default:
-        printf("aic_mem_write: Unhandled write of %0lx to @%0lx of size=%d\n",
-               val, offset, size);
+        printf("aic_mem_write: Unhandled write of %0" PRIx64 " to @%0" PRIx64 " of "
+               "size=%d\n", val, offset, size);
     }
 }
 

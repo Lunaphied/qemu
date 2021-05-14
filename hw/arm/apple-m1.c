@@ -142,7 +142,7 @@ static uint64_t m1_pmgr_read(void *opaque, hwaddr offset, unsigned size)
         return extract64(rvbar, (offset & 4) ? 32 : 0, 32);
     }   
     default:
-        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled read of @ %#lx\n", offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled read of @ %#"PRIx64"\n", offset);
         break;
     }
     return 0;
@@ -200,7 +200,7 @@ static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned si
         break;
     }
     default:
-        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled write of %#x to %#lx\n", value, offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled write of %#x to %#" PRIx64 "\n", value, offset);
         break;
     }
 }
@@ -525,7 +525,7 @@ static void create_apple_dt(MachineState *machine) {
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0};
     bufsize = sizeof(databuf);
-    printf("Mapping device tree at: %lx\n", memmap[M1_ROM].base);
+    printf("Mapping device tree at: %" PRIx64 "\n", memmap[M1_ROM].base);
     rom_add_blob_fixed("device-tree", databuf, bufsize, memmap[M1_ROM].base);
     //g_free(databuf);
     // XXX: Make this use the actual size?
@@ -591,7 +591,7 @@ static void create_boot_args(MachineState *machine) {
     memcpy(bootargs.cmdline, buf, sizeof(buf)); // FIXME: This is stupid
     bootargs.cmdline[sizeof(buf)] = 0x0;
 
-    printf("Mapping boot args tree at: %lx\n", device_tree_end);
+    printf("Mapping boot args tree at: %" PRIx64 "\n", device_tree_end);
     rom_add_blob_fixed("boot-args", &bootargs, sizeof(bootargs), device_tree_end);
 }
 
@@ -686,7 +686,7 @@ static void m1_mac_init(MachineState *machine)
             error_report("Failed to load firmware from %s", machine->firmware);
             exit(1);
         }
-        printf("Firmware loaded@%0lx size=%0x\n", safe_ram_start, load_size);
+        printf("Firmware loaded@%0" PRIx64 " size=%0x\n", safe_ram_start, load_size);
         safe_ram_start += load_size;
     }
     
@@ -701,7 +701,7 @@ static void m1_mac_init(MachineState *machine)
             error_report("Failed to load kernel from %s", machine->kernel_filename);
             exit(1);
         }
-        printf("Kernel loaded@%0lx size=%0x\n", kernel_base, kernel_size);
+        printf("Kernel loaded@%0" PRIx64 " size=%0x\n", kernel_base, kernel_size);
         safe_ram_start += kernel_size;
     }
     
@@ -714,7 +714,7 @@ static void m1_mac_init(MachineState *machine)
             error_report("Failed to load dtb from %s", machine->dtb);
             exit(1);
         }
-        printf("DTB loaded@%0lx size=%0x\n", dtb_base, dtb_size);
+        printf("DTB loaded@%0" PRIx64 " size=%0x\n", dtb_base, dtb_size);
         safe_ram_start += dtb_size;
     }
     
@@ -729,20 +729,20 @@ static void m1_mac_init(MachineState *machine)
             error_report("Failed to load initrd from %s", machine->initrd_filename);
             exit(1);
         }
-        printf("Initrd loaded@%0lx size=%0x\n", initrd_base, initrd_size);
+        printf("Initrd loaded@%0" PRIx64 " size=%0x\n", initrd_base, initrd_size);
         safe_ram_start += initrd_size;
     }
     /* TODO: do this in a better way or not at all it's helpful for dev tho */
     FILE *fconfig = fopen("boot_params.config", "w");
     if (fconfig != NULL) {
         if (kernel_base) {
-            fprintf(fconfig, "kernel\t0x%lx\t0x%x\n", kernel_base, kernel_size);
+            fprintf(fconfig, "kernel\t0x%" PRIx64 "\t0x%x\n", kernel_base, kernel_size);
         }
         if (dtb_base) {
-            fprintf(fconfig, "dtb\t0x%lx\t0x%x\n", dtb_base, dtb_size);
+            fprintf(fconfig, "dtb\t0x%" PRIx64 "\t0x%x\n", dtb_base, dtb_size);
         }
         if (initrd_base) {
-            fprintf(fconfig, "initrd\t0x%lx\t0x%x\n", initrd_base, initrd_size);
+            fprintf(fconfig, "initrd\t0x%" PRIx64 "\t0x%x\n", initrd_base, initrd_size);
         }
         fclose(fconfig);
     }
