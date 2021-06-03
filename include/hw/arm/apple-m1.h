@@ -37,7 +37,8 @@ struct AppleM1State {
     /* Cores */
     /* Icestorm  0..num_icestorm-1 */
     /* Firestorm num_icestorm..num_firestorm-1 */
-    /* TODO Replace this with the proper concept of core clusters */
+    /* TODO: Replace this with the proper concept of core clusters */
+    /* FIXME: These will definitely need Apple specific sub-cpu types */
     ARMCPU icestorm_cores[APPLE_M1_ICESTORM_CPUS];
     ARMCPU firestorm_cores[APPLE_M1_FIRESTORM_CPUS];
 
@@ -46,8 +47,22 @@ struct AppleM1State {
     AppleAICState aic;
     
     /* SoC memory regions */
-    /* FIXME every region created in the .c file needs to move here */
-    MemoryRegion vram_mr;
+    /* TODO: VRAM is actually a part of system RAM but we need to tell the FB code
+     * about where it is somehow, so do that later
+     */
+    MemoryRegion ram_vram_mr;
+    /* I think this is a hack */
+    MemoryRegion ram_vram_alias;
+    
+    /* 
+     * This is used by the reset logic to figure out where to go during reset
+     * technically this is the RVBAR for icestorm core 0 and can probably be
+     * handled directly later
+     */
+    hwaddr boot_args_base;
+
+    /* XXX: This maybe better if renamed to "reset_addr" */
+    hwaddr entry_addr;
 };
 
 #endif // HW_ARM_APPLE_M1_H

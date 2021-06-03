@@ -52,6 +52,20 @@
 #define RAMLIMIT_GB     8192
 #define RAMLIMIT_BYTES  (RAMLIMIT_GB * GiB)
 
+// TODO: Replace this with an argument or add fw_cfg stuff so we can use builtin ramfb code
+// NOTE: In our code we dedicate this region to the framebuffer (since we don't emulate the
+// entire graphics complex yet and want to be able to display stuff still. The framebuffer
+// region on real hardware is just some arbitrary region of memory, (there's more info known
+// now or soon I think about how it's selected but it can definitely move) we will need to
+// somehow carve out sections to be VRAM dynamically rather than allocating one on demand.
+// I think the shadow/write-coalesing memory code is designed to make this work well since
+// I think we already make VRAM normal memory and not MMIO but it will need to not expect
+// itself to get a unique region since I don't think I can "move" the address of regions
+// on demand (sadly we lose the nice memory map info that qemu would have since memory
+// will just be shown as "ram" instead of split up into these neat little regions but
+// we can just pull that from the kernel itself anyway)
+#define VRAM_ZONE_SIZE (500 * MiB)
+
 /* 
  * TODO: this way of mapping memory is probably not ideal, (it's hard to add
  * multiple regions of ram split by IO, we should instead construct this from
@@ -62,46 +76,32 @@ enum {
     M1_UART,        // The virtual uart (on real hardware this is on the type-C and multiplexed via USB-PD selection)
     M1_AIC,         // The Apple interrupt controller
     M1_WDT,         // The M1 Watchdog timer. This is probably actually part of the AIC
-    M1_ROM,         // We setup a block of ROM to keep the initial boot code in
     M1_ARGS,        // A bit of ROM to hold the bootargs
-    M1_VRAM,        // The M1N1 code expects a framebuffer, for now this just means to dump ram in this region
     M1_PMGR,        // Peripheral used to set cores to on (and theoretically off) along with giving them a reset vector address to start at
 };
 // This is used in several other ARM platforms to help collect the addresses and give them meaningful names
 // during realization. These aren't correlated to the M1 hardware at all though it's just easier to set
 // them up like this during dev (the UART is the correct address for where it is when m1n1 loads though)
 // In reality this should be constructed from a hardware device tree provided from an M1 Mac
+// FIXME: Do not merge until this garbage is replaced by dynamic load from either an Apple or Linux style
+// device tree or some other configurable file.
+// NOTE: I think ultimately the best solution here will be to create a data structure that 
+// holds these tied to the machine state or the SoC state and then fill them in from some
+// configuration file
 static const struct MemMapEntry memmap[] = {
-    [M1_ROM] =              {         0x0,              0x10000},
-    //[M1_SPINTABLE] =        {     0x10000,                0x100},
     [M1_UART] =             { 0x235200000,              0x10000},
     [M1_AIC] =              { 0x23B100000,              0x10000},
     [M1_WDT] =              { 0x23D2B0000,                0x100},
     /* TODO: replace this with a real addr from hardware */
     [M1_PMGR] =             { 0x23D300000,                0x100},
-    [M1_VRAM] =             { 0x300000000,                8*GiB},
+    /* NOTE: This contains VRAM as well given the UMA config of the M1 */
     [M1_MEM] =              { 0x800000000,       RAMLIMIT_BYTES},
 };
 
-// TODO: Get rid of this and just handle returning the size from the boot args
-// and device create creation code, also those should be stuffed in ram that's
-// initialized at boot instead of into ROM, ROM should be tiny and used for
-// initializing stuff before jumping in
-static hwaddr device_tree_end = 0;
-
-/*
- * TODO: get rid of this? (or split the boot code into it's own file maybe
- *       a lot of this process for boot is similar to the unique process
- *       that the x86 microvm does (specifically the PVH load))
- */
-
-/* 
- * This stores the first address after the loaded kernel (which might be M1N1
- * alone or a collection of M1N1+linux+device tree+initrd)
- */
-static hwaddr safe_ram_start = 0;
-
 /* Helper function to convert cpu_index to ARMCPU* pointer from complex */
+/* TODO: This feels messy and horrible..., maybe they can be stored together
+ * and then downcast into the correct type once we seperate those?
+ */
 static ARMCPU* m1_get_cpu_by_index(AppleM1State *s, int cpu_index)
 {
     if (cpu_index < APPLE_M1_TOTAL_CPUs) {
@@ -121,6 +121,7 @@ static ARMCPU* m1_get_cpu_by_index(AppleM1State *s, int cpu_index)
  * probably be replicated without using an actual IO peripheral by just using
  * modified startup code, but that can't set the reset vectors so we use this
  */
+// TODO: Move this to it's own damn file
 static uint64_t m1_pmgr_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleM1State *s = APPLE_M1(opaque);
@@ -239,20 +240,25 @@ static void apple_m1_init(Object *obj) {
 // Apple M1 reset needs us to put the correct x0 register to point to our boot args
 static void handle_m1_reset(void *opaque)
 {
-    ARMCPU *cpu = ARM_CPU(opaque);
-    // TODO: Change all this logic into a blob that gets dropped into
-    //       the rom area
-    // TODO: More sanely seperate device_tree_end and boot args
-    // FIXME: It's possible this should be replaced by a rom region that does this
-    // while executing on the cpu
-    
-    // INFO: This way of doing things is actually done on several other machines mostly
-    // not ARM ones though, but using the reset vector like this is fair, most of them
-    // load a bootrom bios into a fixed location, setup the registers to a loaded main binary
-    // image (or just let the bootrom work) and then set the PC to the entrypoint
+    AppleM1State *s = APPLE_M1(opaque);
+    /* TODO: This needs to hold EVERYTHING having to do with the reset ideally
+     * so all the processor state should probably get reset along with maybe
+     * peripherals depending on hw behavior.
+     * 
+     * For now just reset the first icestorm core, not sure if we need to stop the
+     * other cores since I haven't tested much since I made multicore work
+     */
+    ARMCPU *cpu = ARM_CPU(&s->icestorm_cores[0]);
     cpu_reset(CPU(cpu));
-    cpu->env.xregs[0] = device_tree_end;
-    cpu_set_pc(CPU(cpu), memmap[M1_MEM].base+0x4800);
+    /* Entry point code expects x0 to contain the address of the boot arguments */
+    cpu->env.xregs[0] = s->boot_args_base;
+    /* TODO: is cpu_set_pc better than trying to set directly via ARMCPU? */
+    /* Set the entry point for post-reset as was determined from firmware */
+    cpu_set_pc(CPU(cpu), s->entry_addr);
+    /* This makes the cpu have the correct hypervisor config post-reset to
+     * match hardware. I do not like this way of doing this as noted by the
+     * comment below.
+     */
     // FIXME: This seems like a crazy way to initialize this but there's no easy
     // way to do it at the CPU level because CPU reset will reset this to 0.
     // There might be a better way if I look deeper though but this works okay for now
@@ -316,10 +322,16 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
      * are no-longer able to have their reset vectors changed until some type
      * of SoC-level reset occurs (unknown exactly what or if unlock is possible).
      * 
+     * (Update: It appears that RVBAR or an effectively similar function is
+     * tied to the PMGR unit. Poking it with an address causes a core to start 
+     * there and seems to lock it's reset address there?, icestorm core 0 is initial
+     * bring up core, so it probably gets initialized internally somehow)
+     * 
      * So Icestorm core 0 is the one that jumps into the kernel and allows the
      * other cores to be started via the PMGR registers in the SoC.
      */
-    /* TODO: QEMU has some built-in wrappers for clusters and core types
+    /* 
+     * TODO: QEMU has some built-in wrappers for clusters and core types
      * those might be usable here to make this a bit cleaner so it can be
      * a single loop (or we can just move the common initialization somewhere
      * else and keep the two loops), having a single array of CPUs would be
@@ -346,16 +358,10 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     }
 
     /* 
-     * Realize framebuffer, first we have to setup the memory region for VRAM
-     * then we have to setup the property link to that region
+     * Realize framebuffer, VRAM's region is setup for us during the machine init
+     * we just setup the link and realize the framebuffer here.
      */
-    memory_region_init_ram(&s->vram_mr, OBJECT(s), "vram", memmap[M1_VRAM].size,
-                           &error_abort);
-    /* Map the region */
-    memory_region_add_subregion(get_system_memory(), memmap[M1_VRAM].base,
-                                &s->vram_mr);
-    /* Add link for vram */
-    object_property_add_const_link(OBJECT(&s->fb), "vram", OBJECT(&s->vram_mr));
+    object_property_add_const_link(OBJECT(&s->fb), "vram", OBJECT(&s->ram_vram_mr));
     
     /* Now we're safe to realize the device */
     /* TODO: If the framebuffer never gets MMIO it should not be sysbus */
@@ -397,17 +403,8 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->aic), i,
                            qdev_get_gpio_in(dev, ARM_CPU_IRQ));  
     }
+
     /* Connect UART to AIC */
-    /* FIXME: connect to every IRQ bc something weird with linux */
-    /*
-    DeviceState *splitq = qdev_new("split-irq");
-    object_property_add_child(OBJECT(s), "split-irq", OBJECT(splitq));
-    qdev_prop_set_uint16(splitq, "num-lines", AIC_NUM_IRQ);
-    qdev_realize_and_unref(splitq, NULL, &error_fatal);
-    sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(splitq, 0));
-    for (int i = 0; i < AIC_NUM_IRQ; i++) {
-        qdev_connect_gpio_out(splitq, i, qdev_get_gpio_in(DEVICE(&s->aic), i));
-    } */
     sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0, qdev_get_gpio_in(DEVICE(&s->aic), 605));
     
     /* TODO: Connect input IRQs from hardware to this */
@@ -416,8 +413,9 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("Watchdog", memmap[M1_WDT].base, memmap[M1_WDT].size);
     
     // FIXME: Do this properly
-    // Add a reset hook for the first core that will pull in the correct x0 reg for boot_args
-    qemu_register_reset(handle_m1_reset, &s->icestorm_cores[0]);
+    // Add a reset hook, this emulates the processor (and some firmware for now)
+    // for now all it does is reset the first CPU core to the base address
+    qemu_register_reset(handle_m1_reset, s);
     /* TODO: add a reset handler that handles resetting secondaries */
     
     /* Add the power manager peripheral */
@@ -455,44 +453,57 @@ static void apple_m1_register_types(void)
 
 type_init(apple_m1_register_types);
 
+/* 
+ * Helper method to insert a flat image from a file into memory with a given alignment
+ * Offset is updated after load to the next unused address
+ */
+static int load_image_aligned(const char *filename, hwaddr* offset, uint64_t alignment, uint64_t max_sz) {
+    if (!filename || !offset) {
+        return -1;
+    }
+    
+    hwaddr aligned_offset = QEMU_ALIGN_UP(*offset, alignment);
+    int r = load_image_targphys(filename, aligned_offset, max_sz);
+    if (r < 0) {
+        return r;
+    }
+
+    printf("Loaded file %s (size 0x%x) at RAM offset 0x%" HWADDR_PRIx "\n", filename, r, aligned_offset);
+
+    /* Update offset to be next address after written */
+    *offset = aligned_offset + r;
+    return r;
+}
+
+/*
+ * Helper method to insert a blob from memory in an aligned fashion similar to above code
+ */
+static int load_blob_aligned(const char *name, const void *blob, hwaddr* offset, uint64_t alignment, uint64_t size) {
+    if (!name || !offset) {
+        return -1;
+    }
+
+    hwaddr aligned_offset = QEMU_ALIGN_UP(*offset, alignment);
+    /* This is mostly doing the same thing as rom_add_blob_fixed but we need read_only to be false */
+    /* It returns a NULL MemoryRegion* when we don't use fw_cfg */
+    (void) rom_add_blob(name, blob, size, size, aligned_offset, NULL, NULL, NULL, NULL, false);
+
+    printf("Loaded blob %s (size 0x%" PRIx64 ") at RAM offset 0x%" HWADDR_PRIx "\n", name, size, aligned_offset);
+
+    /* Update offset to be next address after written */
+    *offset = aligned_offset + size;
+    return size;
+}
+
 // This builds an apple style device tree then inserts it into memory somewhere, 
 // TODO: Make this a lot nicer (model after the virt platform fdt builders)
 // it should be dynamic (ideally we would take an existing device tree from
 // hardware and then create the other devices using the information so contained
-static void create_apple_dt(MachineState *machine) {
-    struct node_header {
-        uint32_t prop_count;
-        uint32_t child_count;
-    };
-    struct node_property {
-        char name[32];
-        uint32_t size;
-        // after this is a blob of size data (plus padding to align, which is annoying to express)
-    };
-    // TODO: Put more contents in here and do this correctly
-    // FIXME: size this buffer more properly
-    uint32_t bufsize = 0x1000;
-    //uint8_t *databuf = g_malloc0(bufsize);
-#if 0
-    // Add initial root header?
-    struct node_header header = {0x0, 0x1};
-    memcpy(databuf, &header, sizeof(header));
-    databuf += sizeof(header);
-
-    // Add chosen header?
-    header = {0x0, 0x0};
-    memcpy(databuf, &header, sizeof(header));
-    databuf += sizeof(header);
-    struct node_header chosen = {2, 0};
-    struct node_property prop_temp;
-    // Add a parent property for the chosen tree?
-    snprintf(prop_temp.name, 32, "chosen");
-    prop_temp.size = 0;
-#endif
-    // This was generated using an external tool by taking a dts base, compiling to fdt
-    // then converting to adt format. Full ADT support will be needed if we want to boot
-    // OS X though so that we can feed it all the nodes (a modified real ADT dump could 
-    // be used also potentially)
+// This takes an address which will hold the address after the aligned buffer after the call
+// the return value is the size of the buffer, we can use these to reconstruct the aligned_base
+static int init_apple_dt(hwaddr *adt_base) {
+    // TODO: Use the new ADT code to construct this somewhat dynamically at least
+    // TODO: After the above is done we should load this from a file or something
     uint8_t databuf[] = {0x3, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x6e, 0x61, 0x6d, 0x65, 
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
@@ -524,115 +535,139 @@ static void create_apple_dt(MachineState *machine) {
                0x7a, 0x65, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 
                0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0};
-    bufsize = sizeof(databuf);
-    printf("Mapping device tree at: %lx\n", memmap[M1_ROM].base);
-    rom_add_blob_fixed("device-tree", databuf, bufsize, memmap[M1_ROM].base);
-    //g_free(databuf);
-    // XXX: Make this use the actual size?
-    device_tree_end = QEMU_ALIGN_UP(bufsize + memmap[M1_ROM].base, 64);
+    return load_blob_aligned("device-tree", &databuf, adt_base, 8, sizeof(databuf));
 }
 
-#define BOOTARGS_REVISION 0xDEAD
-#define BOOTARGS_FB_DEPTH 30
+/* XNU uses this format and iBoot provides it, so we must also provide it */
+/* This has been rearranged to flatten out into a single level struct */
+struct xnu_boot_args {
+    uint16_t revision;              /* XNU says this is the revision of the boot_args */
+    uint16_t version;               /* Then calls this the "version", how is that different... */
+    uint32_t pad0;                  /* Padding required to avoid packing */
+    uint64_t virtual_base;          /* Virtual base of memory (what this really tells us is how to compensate for ASLR slide) */
+    uint64_t physical_base;         /* Physical base of memory */
+    uint64_t memory_size;           /* Physical memory size before VRAM and SEP carveouts */
+    uint64_t top_of_kernel_data;    /* End address of loaded binary (safe mem starts here) */
+    uint64_t vram_base;             /* Initial framebuffer vram address */
+    uint64_t pad1;                  /* Padding required to avoid packing */ 
+    uint64_t fb_stride;             /* Stride (bytes per row) for vram */
+    uint64_t fb_width;
+    uint64_t fb_height;
+    uint64_t fb_depth;              // TODO: Extract what real hardware puts here
+    uint64_t pad2;                  /* Padding required to avoid packing */
+    uint64_t adt_base;              /* ADT address in memory */
+    uint32_t adt_size;              /* Overall ADT size */
+    char cmdline[608];              /* Kernel cmdline args, m1n1 will pass onwards to linux iirc */
+    uint64_t flags;                 /* I'm assuming some kind of boot flags not covered by cmdline */
+    uint64_t memory_size_actual;    /* This is the real size of physical memory (max physical addr + 1) */
+};
 
-// This builds and then inserts a boot args structure like m1n1 and OS X expect
-// it then puts it into memory (I've moved it to 0x10 so that it's not set to
-// a null pointer)
-/* 
- * NOTE: Must be called after the data is loaded into memory since it relies
- * on safe_ram_start being defined
+/* This fills in the boot_args struct and registers it into memory via the rom system
+ * which should automatically copy it into place upon reset.
+ * NOTE: This code expects device_tree_(base|size) and safe_ram_start to be initialized
+ * already since that's what it's going to fill in.
  */
-static void create_boot_args(MachineState *machine) {
-    /* TODO: Make this a cleaner setup where the machine has a struct
-     * with the M1 SoC inside */
-    AppleM1State *soc;
-    Object *obj = object_property_get_link(OBJECT(machine), "soc", &error_abort);
-    soc = APPLE_M1(obj);
-    /* TODO move this struct out of the function */
-    struct {
-        uint16_t revision;
-        uint16_t pad0;
-        uint32_t pad1;
-        uint64_t virtual_load_base; // TODO: document if this is a load base or memory base
-        uint64_t physical_load_base;
-        uint64_t memory_size;
-        uint64_t loaded_end;        // End address of loaded binary (safe mem starts here)
-        uint64_t fb_addr;           // Framebuffer address in memory
-        uint64_t pad2;
-        uint64_t fb_stride;         // Stride (bytes per line)
-        uint64_t fb_width;
-        uint64_t fb_height;
-        uint64_t fb_depth;          // TODO: Extract what real hardware puts here
-        uint64_t pad3;
-        uint64_t device_tree;
-        uint32_t device_tree_size;
-        char cmdline[608];
-        uint64_t flags;
-        uint64_t unknown;
-    } bootargs;
-    bootargs.revision = 0xdead;
-    bootargs.virtual_load_base = memmap[M1_MEM].base;
-    bootargs.physical_load_base = memmap[M1_MEM].base;
-    bootargs.memory_size = machine->ram_size;
-    bootargs.loaded_end = safe_ram_start;
-    bootargs.fb_addr = memmap[M1_VRAM].base;
-    /* TODO Clean this up */
-    bootargs.fb_stride = soc->fb.width*4;
-    bootargs.fb_width = soc->fb.width;
-    bootargs.fb_height = soc->fb.height;
-    bootargs.fb_depth = BOOTARGS_FB_DEPTH;
+static void initialize_boot_args(AppleM1State *s, hwaddr phys_mem_base, hwaddr mem_size,
+                                 hwaddr mem_size_actual, hwaddr top_of_kernel_data,
+                                 hwaddr vram_base, hwaddr adt_base, hwaddr adt_size) {
+    /* First we construct a bootargs struct, then we use the rom system to insert it */
+    /* The memory region must already be initialized, since that's what's expected here */
+    struct xnu_boot_args boot_args = {0, };
 
-    // FIXME: There's got to be a better way of doing it than this. Maybe a property or something? Maybe not?
-    bootargs.device_tree = memmap[M1_ROM].base;
-    bootargs.device_tree_size = device_tree_end - memmap[M1_ROM].base;
+    /* Revsion is arbitrary and set to something to catch issues */
+    boot_args.revision = cpu_to_le16(0xdead);
 
-    char buf[] ="no cmdline lol";
-    memset(bootargs.cmdline, 0, sizeof(bootargs.cmdline));
-    memcpy(bootargs.cmdline, buf, sizeof(buf)); // FIXME: This is stupid
-    bootargs.cmdline[sizeof(buf)] = 0x0;
+    /* We don't do an ASLR slide but we could to try and catch issues in M1N1/Firmware */
+    /* Therefore virtual and physical bases are identical */
+    boot_args.virtual_base = cpu_to_le64(phys_mem_base);
+    boot_args.physical_base = boot_args.virtual_base;
 
-    printf("Mapping boot args tree at: %lx\n", device_tree_end);
-    rom_add_blob_fixed("boot-args", &bootargs, sizeof(bootargs), device_tree_end);
+    /* This memory size is post carveout */
+    boot_args.memory_size = cpu_to_le64(mem_size);
+    boot_args.top_of_kernel_data = cpu_to_le64(top_of_kernel_data);
+
+    /* TODO: VRAM size is assumed to fit the fb_stride*fb_height bytes we should validate */
+    boot_args.vram_base = cpu_to_le64(vram_base);
+    boot_args.fb_stride = cpu_to_le64(s->fb.width*4);
+    boot_args.fb_width = cpu_to_le64(s->fb.width);
+    boot_args.fb_height = cpu_to_le64(s->fb.height);
+    /* TODO: Find out what this is in the real world*/
+    boot_args.fb_depth = cpu_to_le64(30);
+
+    boot_args.adt_base = cpu_to_le64(adt_base);
+    boot_args.adt_size = cpu_to_le64(adt_size);
+
+    /* For now do this, later we should probably pass it a real command line */
+    const char* buf = "no cmdline lol";
+    snprintf(boot_args.cmdline, sizeof(boot_args.cmdline), "%s", buf);
+    /* 
+     * Now insert it into memory at the correct address, this will be reloaded on
+     * reset since it's registered as a rom region
+     */
+    int size = load_blob_aligned("boot-args", &boot_args, &s->boot_args_base, sizeof(uint64_t), sizeof(boot_args));
+    /* 
+     * The above modifies the provided offset, it also potentially adds alignment padding we must
+     * fix the written address to be the unpadded base by backtracking from the end by the size 
+     */
+    s->boot_args_base -= size;
 }
 
 static void m1_mac_init(MachineState *machine)
 {
+    /*
+     * Allocate the M1 SoC state so we can fill in bits of it
+     * However we purposefully do not link it to the machine and realize it until later
+     * on when things like the VRAM memory region have been filled in.
+     */
     AppleM1State *m1;
-
     m1 = APPLE_M1(qdev_new(TYPE_APPLE_M1));
-    object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
-    qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
 
     // This initializes the memory region map
     MemoryRegion *sysmem = get_system_memory();
 
-    /* 
-     * I think it's okay that this doesn't get freed later since many machines
-     * create unfreed memory in their init, since it seems machines aren't meant
-     * to be created multiple times ever, it's also the only way to create
-     * anonymous MemoryRegion blocks which is helpful when you have lots of them
-     * and don't need to keep the pointers other than for potential freeing
-     */
-    /* Create a memory region for the boot arguments (boot_args, ADT, startup code) */
-    MemoryRegion *boot_args = g_new0(MemoryRegion, 1);
-    memory_region_init_rom(boot_args, NULL, "boot-args", memmap[M1_ROM].size,
-                           &error_abort);
-    /* Add the ROM region to the system memory map */
-    memory_region_add_subregion(sysmem, memmap[M1_ROM].base, boot_args);
-    /* Add the RAM created for us to the main system memory space */
-    memory_region_add_subregion(sysmem, memmap[M1_MEM].base, machine->ram);
+    /* TODO: Memory region mapping should probably be split into being somewhere else */
+    /* Grab the base address of physical memory in the address space */
+    hwaddr phys_base = memmap[M1_MEM].base;
+    /* Compute the final valid physical memory address */
+    hwaddr phys_end = memmap[M1_MEM].base+machine->ram_size;
+
+    /* Check to make sure there's enough memory for VRAM */
+    if (VRAM_ZONE_SIZE >= phys_end) {
+        error_report("Insufficent RAM size (VRAM would not fit).\n");
+        exit(1);
+    }
+
+    /* VRAM is stolen from the final bit of ram */
+    hwaddr vram_base = phys_end - VRAM_ZONE_SIZE;
+
+    /* Map the pre-allocated machine memory into the system memory */
+    memory_region_add_subregion(sysmem, phys_base, machine->ram);
+
+    /* Map the VRAM region to the correct address */
+    memory_region_init_alias(&m1->ram_vram_alias, OBJECT(m1), "vram", machine->ram,
+                             vram_base, VRAM_ZONE_SIZE);
+    memory_region_init(&m1->ram_vram_mr, OBJECT(m1), "vram-fb-container-hack", VRAM_ZONE_SIZE);
+    /* Make a container with offset 0 that the fb can use to access the vram as if it starts at 0 */
+    memory_region_add_subregion(&m1->ram_vram_mr, 0, &m1->ram_vram_alias);
+
+    /* Now we can initialize the M1 SoC class itself since the vram region is setup */
+    /* TODO: Move this to the end of this function since it probably logically goes there */
+    object_property_add_child(OBJECT(machine), "soc", OBJECT(m1));
+    qdev_realize_and_unref(DEVICE(m1), NULL, &error_abort);
 
     /* This is for loading M1N1 which acts as a sort of replacement firmware */
-    /* We will want to do some sort of stub firmware loader first before M1N1
-     * to setup the registers and boot args it expects, but for now we abuse
-     * the reset handler and use ROM regions (we want to replace these with RAM
-     * that reloads on CPU reset or something)
-     * 
+    /* 
      * NOTE: we cannot really use the helper functions from arm/boot.c because
      * loading elfs offers no control over the load address (it just uses the
      * physical values which are offset from 0 for m1n1), we also want to start
      * M1N1 with certain register and memory regions setup like iBoot would with
-     * info about the hardware (Apple's form of DTB)
+     * info about the hardware (Apple's form of DTB).
+     * 
+     * (Update: The above is sort of true, the helpers in arm/boot.c aren't well
+     * suited for our uses here, but the generic rom loading stuff for loading
+     * elf's could probably be modified to fit our purposes. The elf code allows
+     * specifying a translate function which we could use to patch the address
+     * problem)
      * 
      * We want to support this boot process in addition to a semi-standard
      * "just load the kernel" method where we can directly load the kernel,
@@ -645,14 +680,12 @@ static void m1_mac_init(MachineState *machine)
      * support emulation of OS X which is indeed an important goal here.
      * 
      * For now we have a compromise. M1N1 is loaded as "firmware" which
-     * essentially means we just grab the mach-o (which is intended to be loaded
+     * essentially means we just grab the mach-o (which is allowed to be loaded
      * as a flat image with a fixed entry point) and dump it into memory, setup
      * the required boot arguments (because only QEMU knows the values for
      * those) and jump in, with some helper code to dump a kernel, initrd and
      * dtb into memory so that proxy code can start it without copying it over
-     * the serial port. When I pull in the latest M1N1 changes again this can
-     * likely be changed to append the image like a concatenated M1N1 (but done
-     * dynamically in QEMU) so the proxy part wouldn't be needed.
+     * the serial port. 
      * 
      * In the future we may want to support directly starting linux without
      * a bootloader if M1N1 isn't provided, this will likely be required for
@@ -663,76 +696,76 @@ static void m1_mac_init(MachineState *machine)
      * TL;DR There's a plan for loading, for now it's almost the simplest thing
      * but not quite.
      */
-    safe_ram_start = memmap[M1_MEM].base;
-    
-    /* Keeps base and size so we can write a boot_param.config for qemu loader */
-    hwaddr kernel_base = 0;
-    int kernel_size = 0;
-    hwaddr dtb_base = 0;
-    int dtb_size = 0;
-    hwaddr initrd_base = 0;
-    int initrd_size = 0;
+    hwaddr offset = phys_base;
+    printf("phys_base: 0x%" HWADDR_PRIx "\n", phys_base);
+    hwaddr remaining_mem = machine->ram_size - VRAM_ZONE_SIZE;
+
+    /*
+     * We put the ADT right in front of the "firmware" since m1n1 doesn't expect itself
+     * to be the first firmware, I think this is best changed to be handled internal
+     * with some code to have M1N1 construct an ADT using fw_cfg values or something
+     */
+    /* FIXME: We prealign because otherwise alignment might mean we don't know the base */
+    hwaddr adt_base = QEMU_ALIGN_UP(offset, 8);
+    int adt_size = init_apple_dt(&offset);
     
     /* TODO move these to specific helper functions, model after ppc/riscv boot
      * helper code which *does* work well with platforms that don't want to
      * have reset handled (unlike the ARM booter functions) */
     if (machine->firmware) {
-        /* Align firmware to a 4K page */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 4096);
-        //printf("Found firmware: %s\n", machine->firmware);
-        int load_size = load_image_targphys(machine->firmware, safe_ram_start,
-                                        memmap[M1_MEM].size);
-        if (kernel_size < 0) {
+        /* Align firmware to a 16K page */
+        int result = load_image_aligned(machine->firmware, &offset, 65536, remaining_mem);
+        if (result < 0) {
             error_report("Failed to load firmware from %s", machine->firmware);
             exit(1);
         }
-        printf("Firmware loaded@%0lx size=%0x\n", safe_ram_start, load_size);
-        safe_ram_start += load_size;
+        remaining_mem -= result;
     }
     
     if (machine->kernel_filename) {
-        /* Align kernel to a 2MB addr */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 2 * 1024 * 1024);
-        kernel_base = safe_ram_start;
-        printf("Found kernel: %s\n", machine->kernel_filename);
-        kernel_size = load_image_targphys(machine->kernel_filename, kernel_base,
-                                        memmap[M1_MEM].size);
-        if (kernel_size < 0) {
+        /* Align kernel to 2 MiB */
+        int result = load_image_aligned(machine->kernel_filename, &offset, 2*1024*1024, remaining_mem);
+        if (result < 0) {
             error_report("Failed to load kernel from %s", machine->kernel_filename);
             exit(1);
         }
-        printf("Kernel loaded@%0lx size=%0x\n", kernel_base, kernel_size);
-        safe_ram_start += kernel_size;
+        remaining_mem -= result;
     }
-    
+
     if (machine->dtb) {
-        printf("Found dtb: %s\n", machine->dtb);
-        dtb_base = safe_ram_start;
-        dtb_size = load_image_targphys(machine->dtb, dtb_base, 
-                                       memmap[M1_MEM].size);
-        if (dtb_size < 0) {
+        /* Align dtb to a 16K page */
+        int result = load_image_aligned(machine->dtb, &offset, 65536, remaining_mem);
+        if (result < 0) {
             error_report("Failed to load dtb from %s", machine->dtb);
             exit(1);
         }
-        printf("DTB loaded@%0lx size=%0x\n", dtb_base, dtb_size);
-        safe_ram_start += dtb_size;
+        remaining_mem -= result;
     }
-    
+
     if (machine->initrd_filename) {
-        /* Align initrd to 64K like M1N1 does for some reason */
-        safe_ram_start = QEMU_ALIGN_UP(safe_ram_start, 65536);
-        initrd_base = safe_ram_start;
-        printf("Found initrd: %s\n", machine->initrd_filename);
-        initrd_size = load_image_targphys(machine->initrd_filename, initrd_base,
-                                        memmap[M1_MEM].size);
-        if (initrd_size < 0) {
+        /* Align initrd_filename to 64K, I believe linux gets mad otherwise */
+        int result = load_image_aligned(machine->initrd_filename, &offset, 65536, remaining_mem);
+        if (result < 0) {
             error_report("Failed to load initrd from %s", machine->initrd_filename);
             exit(1);
         }
-        printf("Initrd loaded@%0lx size=%0x\n", initrd_base, initrd_size);
-        safe_ram_start += initrd_size;
+        remaining_mem -= result;
     }
+    /* FIXME: Another prealignment */
+    offset = ROUND_UP(offset, 8);
+    m1->boot_args_base = offset;
+    initialize_boot_args(m1, phys_base, remaining_mem, phys_end - phys_base, offset,
+                         vram_base, adt_base, adt_size);
+
+    /* NOTE: This can be removed once our loading code either emulates Mach-O enough to
+     * not confuse M1N1 when trying to get m1n1 to auto-boot the packed together image
+     * or when M1N1 itself is modified to be more friendly to QEMU usage such that
+     * it handles being loaded as a cat'd binary even when loaded flat
+     */
     /* TODO: do this in a better way or not at all it's helpful for dev tho */
+    /* 
+     * TODO: Fix this next patch because accesser functions need an additional param to 
+     * write back aligned base to make this work easily
     FILE *fconfig = fopen("boot_params.config", "w");
     if (fconfig != NULL) {
         if (kernel_base) {
@@ -746,19 +779,14 @@ static void m1_mac_init(MachineState *machine)
         }
         fclose(fconfig);
     }
-    /* 
-     * NOTE: These come after because we need to know the size of the loaded
-     * data to safely load things
-     */
-    // Add apple flavored device tree
-    create_apple_dt(machine);
-    // Add boot args
-    create_boot_args(machine);
+    */
 }
 
 static void m1_mac_machine_init(MachineClass *mc)
 {
-    /* TODO: Clean this up a bit */
+    /* TODO: These constants and things should be specified more realistically
+     * since they're just kinda pulled out of nowhere right now.
+     */
     mc->init = m1_mac_init;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
@@ -774,4 +802,5 @@ static void m1_mac_machine_init(MachineClass *mc)
 }
 
 // TODO: Change this when docs can be changed
+// TODO: What am I trying to change!?
 DEFINE_MACHINE("apple-m1", m1_mac_machine_init)
