@@ -143,7 +143,7 @@ static uint64_t m1_pmgr_read(void *opaque, hwaddr offset, unsigned size)
         return extract64(rvbar, (offset & 4) ? 32 : 0, 32);
     }   
     default:
-        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled read of @ %#lx\n", offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled read of @ %#" HWADDR_PRIx "\n", offset);
         break;
     }
     return 0;
@@ -201,7 +201,7 @@ static void m1_pmgr_write(void *opaque, hwaddr offset, uint64_t val, unsigned si
         break;
     }
     default:
-        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled write of %#x to %#lx\n", value, offset);
+        qemu_log_mask(LOG_UNIMP, "M1 PMGR: Unhandled write of %#x to %#" HWADDR_PRIx "\n", value, offset);
         break;
     }
 }
@@ -254,6 +254,7 @@ static void handle_m1_reset(void *opaque)
     cpu->env.xregs[0] = s->boot_args_base;
     /* TODO: is cpu_set_pc better than trying to set directly via ARMCPU? */
     /* Set the entry point for post-reset as was determined from firmware */
+    printf("Entry addr was: 0x%" HWADDR_PRIx "\n", s->entry_addr);
     cpu_set_pc(CPU(cpu), s->entry_addr);
     /* This makes the cpu have the correct hypervisor config post-reset to
      * match hardware. I do not like this way of doing this as noted by the
@@ -644,11 +645,22 @@ static void m1_mac_init(MachineState *machine)
     memory_region_add_subregion(sysmem, phys_base, machine->ram);
 
     /* Map the VRAM region to the correct address */
-    memory_region_init_alias(&m1->ram_vram_alias, OBJECT(m1), "vram", machine->ram,
-                             vram_base, VRAM_ZONE_SIZE);
-    memory_region_init(&m1->ram_vram_mr, OBJECT(m1), "vram-fb-container-hack", VRAM_ZONE_SIZE);
-    /* Make a container with offset 0 that the fb can use to access the vram as if it starts at 0 */
-    memory_region_add_subregion(&m1->ram_vram_mr, 0, &m1->ram_vram_alias);
+    /* NOTE: We tried to do this as an lias and it simply didn't work, the FB memory helper
+     * code gets extermely upset by that, (memory_region_find returns NULL), even if it did
+     * work we'd be left with VGA writeback mode being set on the entire system memory
+     * which is probably bad. I wanted to do this with the alias to better represent the
+     * real hardware and avoid allocating shadowed memory, but there are other workarounds
+     * and it probably doesn't even matter since unused regions will probably be swapped out
+     * and/or never faulted in since they're unaccessed. Furthermore we could emulate the
+     * ram-fb code which directly accesses the memory and I think doesn't bother with the
+     * helpers although that might be bad performance wise. Either way the alias approach is
+     * totally broken
+     */
+    memory_region_init_ram(&m1->ram_vram_mr, OBJECT(m1), "vram", VRAM_ZONE_SIZE, &error_abort);
+
+    /* The VRAM is system accessable too so add it to the main system map shadowing normal RAM */
+    /* We actually add it to the RAM region itself for various reasons */
+    memory_region_add_subregion_overlap(machine->ram, vram_base - phys_base, &m1->ram_vram_mr, 0);
 
     /* Now we can initialize the M1 SoC class itself since the vram region is setup */
     /* TODO: Move this to the end of this function since it probably logically goes there */
@@ -719,6 +731,9 @@ static void m1_mac_init(MachineState *machine)
             error_report("Failed to load firmware from %s", machine->firmware);
             exit(1);
         }
+    	// HACK: Total hack to hardcode entry offset of m1n1 for post reset
+        m1->entry_addr = offset - result + 0x4800;
+        printf("Entry addr computed was: 0x%llx\n", m1->entry_addr);
         remaining_mem -= result;
     }
     
@@ -752,7 +767,8 @@ static void m1_mac_init(MachineState *machine)
         remaining_mem -= result;
     }
     /* FIXME: Another prealignment */
-    offset = ROUND_UP(offset, 8);
+    /* This padding is required because if we load m1n1 flat instead of properly, the space for the bss region isn't computed properly */
+    offset = ROUND_UP(offset+0x100000, 8);
     m1->boot_args_base = offset;
     initialize_boot_args(m1, phys_base, remaining_mem, phys_end - phys_base, offset,
                          vram_base, adt_base, adt_size);
