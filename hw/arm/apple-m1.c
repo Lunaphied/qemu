@@ -579,9 +579,9 @@ static void initialize_boot_args(AppleM1State *s, hwaddr phys_mem_base, hwaddr m
     boot_args.revision = cpu_to_le16(0xdead);
 
     /* We don't do an ASLR slide but we could to try and catch issues in M1N1/Firmware */
-    /* Therefore virtual and physical bases are identical */
-    boot_args.virtual_base = cpu_to_le64(phys_mem_base);
-    boot_args.physical_base = boot_args.virtual_base;
+    /* Virtual base is relied on being connected to what m1n1 says it should be */
+    boot_args.virtual_base = cpu_to_le64(0xfffffe0010000000);
+    boot_args.physical_base = cpu_to_le64(phys_mem_base);
 
     /* This memory size is post carveout */
     boot_args.memory_size = cpu_to_le64(mem_size);
@@ -595,12 +595,15 @@ static void initialize_boot_args(AppleM1State *s, hwaddr phys_mem_base, hwaddr m
     /* TODO: Find out what this is in the real world*/
     boot_args.fb_depth = cpu_to_le64(30);
 
-    boot_args.adt_base = cpu_to_le64(adt_base);
+    boot_args.adt_base = cpu_to_le64(adt_base-phys_mem_base+0xfffffe0010000000);
     boot_args.adt_size = cpu_to_le64(adt_size);
 
     /* For now do this, later we should probably pass it a real command line */
     const char* buf = "no cmdline lol";
     snprintf(boot_args.cmdline, sizeof(boot_args.cmdline), "%s", buf);
+
+    /* XXX: Don't know if this is right yet */
+    boot_args.memory_size_actual = vram_base + VRAM_ZONE_SIZE - phys_mem_base;
     /* 
      * Now insert it into memory at the correct address, this will be reloaded on
      * reset since it's registered as a rom region
