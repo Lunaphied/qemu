@@ -736,7 +736,7 @@ static void m1_mac_init(MachineState *machine)
         }
     	// HACK: Total hack to hardcode entry offset of m1n1 for post reset
         m1->entry_addr = offset - result + 0x4800;
-        printf("Entry addr computed was: 0x%llx\n", m1->entry_addr);
+        printf("Entry addr computed was: 0x%" HWADDR_PRIx "\n", m1->entry_addr);
         remaining_mem -= result;
     }
     
