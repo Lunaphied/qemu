@@ -51,6 +51,8 @@ struct AppleM1State {
      * about where it is somehow, so do that later
      */
     MemoryRegion ram_vram_mr;
+
+    MemoryRegion rom_first_stage_mr;
     
     /* 
      * This is used by the reset logic to figure out where to go during reset

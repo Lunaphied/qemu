@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "exec/address-spaces.h"
 #include "qapi/error.h"
+#include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -237,35 +238,6 @@ static void apple_m1_init(Object *obj) {
     object_initialize_child(obj, "aic", &s->aic, TYPE_APPLE_AIC);
 }
 
-// Apple M1 reset needs us to put the correct x0 register to point to our boot args
-static void handle_m1_reset(void *opaque)
-{
-    AppleM1State *s = APPLE_M1(opaque);
-    /* TODO: This needs to hold EVERYTHING having to do with the reset ideally
-     * so all the processor state should probably get reset along with maybe
-     * peripherals depending on hw behavior.
-     * 
-     * For now just reset the first icestorm core, not sure if we need to stop the
-     * other cores since I haven't tested much since I made multicore work
-     */
-    ARMCPU *cpu = ARM_CPU(&s->icestorm_cores[0]);
-    cpu_reset(CPU(cpu));
-    /* Entry point code expects x0 to contain the address of the boot arguments */
-    cpu->env.xregs[0] = s->boot_args_base;
-    /* TODO: is cpu_set_pc better than trying to set directly via ARMCPU? */
-    /* Set the entry point for post-reset as was determined from firmware */
-    printf("Entry addr was: 0x%" HWADDR_PRIx "\n", s->entry_addr);
-    cpu_set_pc(CPU(cpu), s->entry_addr);
-    /* This makes the cpu have the correct hypervisor config post-reset to
-     * match hardware. I do not like this way of doing this as noted by the
-     * comment below.
-     */
-    // FIXME: This seems like a crazy way to initialize this but there's no easy
-    // way to do it at the CPU level because CPU reset will reset this to 0.
-    // There might be a better way if I look deeper though but this works okay for now
-    cpu->env.cp15.hcr_el2 = 0x30488000000;
-}   
-
 /*
  * TODO Cleanup and maybe move this to a device per core complex (linked to
  * ARMCPU pointers stored in a top-level)
@@ -412,12 +384,6 @@ static void apple_m1_realize(DeviceState *dev, Error **errp)
     //create_unimplemented_device("AIC", memmap[M1_AIC].base, memmap[M1_AIC].size); 
     // TODO: Implement
     create_unimplemented_device("Watchdog", memmap[M1_WDT].base, memmap[M1_WDT].size);
-    
-    // FIXME: Do this properly
-    // Add a reset hook, this emulates the processor (and some firmware for now)
-    // for now all it does is reset the first CPU core to the base address
-    qemu_register_reset(handle_m1_reset, s);
-    /* TODO: add a reset handler that handles resetting secondaries */
     
     /* Add the power manager peripheral */
     /* TODO: This needs to be real device added to the AppleM1State struct */
@@ -616,6 +582,59 @@ static void initialize_boot_args(AppleM1State *s, hwaddr phys_mem_base, hwaddr m
     s->boot_args_base -= size;
 }
 
+/*
+ * Initialize the first stage bootloader, which is executed on reset.
+ * It sets up registers and jumps to the firmware’s entry point.
+ */
+static void init_first_stage_bootloader(MemoryRegion *region, Object *owner,
+    hwaddr entry_point, hwaddr arg)
+{
+    // Parameter structure written at the end of the bootloader
+    struct {
+        uint64_t arg;
+        uint64_t entry;
+    } params = {
+        .arg = cpu_to_le64(arg),
+        .entry = cpu_to_le64(entry_point),
+    };
+
+    const char* file = qemu_find_file(QEMU_FILE_TYPE_BIOS, "m1boot.bin");
+    if (!file) {
+        fprintf(stderr, "Unable to find first stage bootloader m1boot.bin\n");
+        exit(1);
+    }
+
+    int64_t res = get_image_size(file);
+    if (res < 0) {
+        fprintf(stderr, "Unable to access first stage bootloader %s\n", file);
+        exit(1);
+    }
+
+    size_t bootloader_size = (size_t)res;
+    if (bootloader_size < sizeof(params)) {
+        fprintf(stderr, "Invalid first stage bootloader %s\n", file);
+        exit(1);
+    }
+
+    memory_region_init_rom(region, owner, "first_stage_bootloader",
+                           (size_t)bootloader_size, &error_fatal);
+
+    // Map the bootloader at address 0, which is the CPU’s reset address
+    memory_region_add_subregion(get_system_memory(), 0, region);
+
+    // Load the bootloader data
+    uint8_t* rom_data = memory_region_get_ram_ptr(region);
+    res = load_image_size(file, rom_data, bootloader_size - sizeof(params));
+    if (res < 0) {
+        fprintf(stderr, "Error loading first stage bootloader %s\n", file);
+        exit(1);
+    }
+
+    // Copy the params
+    memcpy(rom_data + bootloader_size - sizeof(params), &params,
+           sizeof(params));
+}
+
 static void m1_mac_init(MachineState *machine)
 {
     /*
@@ -799,6 +818,10 @@ static void m1_mac_init(MachineState *machine)
         fclose(fconfig);
     }
     */
+
+    /* Initialize the first stage bootloader */
+    init_first_stage_bootloader(&m1->rom_first_stage_mr, OBJECT(m1),
+        m1->entry_addr, m1->boot_args_base);
 }
 
 static void m1_mac_machine_init(MachineClass *mc)

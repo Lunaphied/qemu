@@ -102,11 +102,14 @@ build-seabios-config-%: config.%
 		OUT=$(CURDIR)/seabios/builds/$*/ all
 
 
-.PHONY: sgabios skiboot qboot
+.PHONY: sgabios skiboot qboot m1boot
 sgabios:
 	$(MAKE) -C sgabios
 	cp sgabios/sgabios.bin ../pc-bios
 
+m1boot:
+	$(MAKE) -C m1boot
+	cp m1boot/m1boot.bin ../pc-bios
 
 pxerom: $(patsubst %,pxe-rom-%,$(pxerom_variants))
 

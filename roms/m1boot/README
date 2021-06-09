@@ -1,0 +1,19 @@
+M1 hardware minimal bootloader
+
+A simple first stage bootloader that takes the role of iBoot. It configures
+the M1 CPU registers in the same way that iBoot does and jump to the entry
+point.
+
+Compile m1boot
+==============
+
+$ make
+
+Usage
+=====
+
+Automatically used by the apple-m1 machine. m1boot is loaded at physical
+address 0, and the two last u64 values of its data are replaced:
+ - The penultimate u64 value (arg) will be loaded into x0 before jumping to
+   the entry point. It should contain the address of the boot parameters.
+ - The last u64 value (entry) is the entry point address.
