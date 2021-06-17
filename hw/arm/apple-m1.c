@@ -256,14 +256,16 @@ static void handle_m1_reset(void *opaque)
     /* Set the entry point for post-reset as was determined from firmware */
     printf("Entry addr was: 0x%" HWADDR_PRIx "\n", s->entry_addr);
     cpu_set_pc(CPU(cpu), s->entry_addr);
-    /* This makes the cpu have the correct hypervisor config post-reset to
-     * match hardware. I do not like this way of doing this as noted by the
-     * comment below.
-     */
-    // FIXME: This seems like a crazy way to initialize this but there's no easy
-    // way to do it at the CPU level because CPU reset will reset this to 0.
-    // There might be a better way if I look deeper though but this works okay for now
-    cpu->env.cp15.hcr_el2 = 0x30488000000;
+
+    /* Set the initial register state to match the hardware.
+     * This is a valid way to do it (used in other modules) but must be done
+     * with care since it bypasses the checks done by the register handler. */
+
+    /* Set the correct hypervisor configuration */
+    cpu->env.cp15.hcr_el2 = HCR_API | HCR_APK | HCR_E2H | HCR_RW | HCR_TGE;
+
+    /* Rebuild qemu's hidden flags after changing register state */
+    arm_rebuild_hflags(&cpu->env);
 }   
 
 /*
